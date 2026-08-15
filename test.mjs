@@ -46,6 +46,17 @@ assert.deepStrictEqual(o.messages[1], { role: 'user', content: 'hi' });
 assert.deepStrictEqual(o.messages[2].tool_calls[0], { id: 't1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a.txt"}' } });
 assert.deepStrictEqual(o.messages[3], { role: 'tool', tool_call_id: 't1', content: 'xyz' });
 
+// toOpenAI: trailing assistant tool_use with no tool_result must not produce a dangling tool_calls message
+const d = toOpenAI({
+  model: 'kimi-k3',
+  messages: [
+    { role: 'user', content: [{ type: 'text', text: 'go' }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't9', name: 'bash', input: { command: 'ls' } }] },
+  ],
+});
+assert.strictEqual(d.messages.length, 1, 'dangling tool_calls message should be dropped');
+assert.deepStrictEqual(d.messages[0], { role: 'user', content: 'go' });
+
 // fromOpenAI: non-stream completion with tool call
 const an = fromOpenAI({
   id: 'x1', model: 'kimi-k3', usage: { prompt_tokens: 10, completion_tokens: 5 },

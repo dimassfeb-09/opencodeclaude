@@ -105,8 +105,8 @@ function Save-KeyFor([string]$Plan, [string]$Key) {
 
 function Set-Plan([string]$Plan) {
   $Plan = $Plan.Trim().ToLower()
-  if ($Plan -notin @('go', 'zen')) {
-    Write-Host "Plan must be 'go' or 'zen'."
+  if ($Plan -notin @('go', 'zen', 'free')) {
+    Write-Host "Plan must be 'go', 'zen' or 'free'."
     exit 1
   }
   $cfg = Read-Config
@@ -117,7 +117,7 @@ function Set-Plan([string]$Plan) {
 
 function Get-Plan {
   $p = (Read-Config)['OPENCODE_PLAN']
-  if ($p -in @('go', 'zen')) { return $p }
+  if ($p -in @('go', 'zen', 'free')) { return $p }
   return 'go'
 }
 
@@ -127,14 +127,16 @@ function Get-PlanConfigured {
 
 function Invoke-PlanPrompt {
   Show-Banner 'Choose your OpenCode plan'
-  Write-Host "$Dim  1) $Green$Bold go$Reset$Dim  - flat-fee Go subscription$Reset"
-  Write-Host "$Dim  2) $Green$Bold zen$Reset$Dim - pay-as-you-go Zen$Reset"
+  Write-Host "$Dim  1) $Green$Bold go$Reset$Dim   - flat-fee Go subscription$Reset"
+  Write-Host "$Dim  2) $Green$Bold zen$Reset$Dim  - pay-as-you-go Zen$Reset"
+  Write-Host "$Dim  3) $Green$Bold free$Reset$Dim - no account needed, free models only$Reset"
   Write-Host ''
   for ($i = 0; $i -lt 3; $i++) {
-    $p = (Read-Host "$Accent$Bold Choose plan [1/2]$Reset").Trim().ToLower()
+    $p = (Read-Host "$Accent$Bold Choose plan [1/2/3]$Reset").Trim().ToLower()
     if ($p -eq '1' -or $p -eq 'go') { Set-Plan 'go'; return }
     if ($p -eq '2' -or $p -eq 'zen') { Set-Plan 'zen'; return }
-    Write-Host "$Yellow Pick 1, 2, 'go' or 'zen'.$Reset"
+    if ($p -eq '3' -or $p -eq 'free') { Set-Plan 'free'; return }
+    Write-Host "$Yellow Pick 1, 2, 3, 'go', 'zen' or 'free'.$Reset"
   }
   Write-Host "$Yellow Aborting after 3 invalid attempts.$Reset"
   exit 1
@@ -227,22 +229,27 @@ if (-not (Get-PlanConfigured)) {
 }
 
 $plan = Get-Plan
-$key = Get-KeyFor $plan
+$freeMode = $plan -eq 'free'
+$key = $null
 
-if (-not $key -and $env:OPENCODE_API_KEY) {
-  $key = $env:OPENCODE_API_KEY.Trim()
-  Write-Host 'Using OPENCODE_API_KEY from environment; saving for next time.'
-  Save-KeyFor $plan $key
-}
-
-if (-not $key) {
-  Invoke-Setup $plan
+if (-not $freeMode) {
   $key = Get-KeyFor $plan
-}
 
-if (-not $key) {
-  Write-Host "No API key available for the '$plan' plan. Run 'opencodeclaude key' to set one."
-  exit 1
+  if (-not $key -and $env:OPENCODE_API_KEY) {
+    $key = $env:OPENCODE_API_KEY.Trim()
+    Write-Host 'Using OPENCODE_API_KEY from environment; saving for next time.'
+    Save-KeyFor $plan $key
+  }
+
+  if (-not $key) {
+    Invoke-Setup $plan
+    $key = Get-KeyFor $plan
+  }
+
+  if (-not $key) {
+    Write-Host "No API key available for the '$plan' plan. Run 'opencodeclaude key' to set one."
+    exit 1
+  }
 }
 
 # --- prereqs ---------------------------------------------------------------
@@ -258,17 +265,24 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
 
 # --- plan & models ---------------------------------------------------------
 $plan = Get-Plan
-Write-Host "$Accent$Bold ● opencodeclaude$Reset  $Dim> using$Reset $Green$Bold$plan$Reset$Dim plan$Reset$Dim  (change: opencodeclaude plan go|zen, key: opencodeclaude key)$Reset"
+$freeMode = $plan -eq 'free'
+Write-Host "$Accent$Bold ● opencodeclaude$Reset  $Dim> using$Reset $Green$Bold$plan$Reset$Dim plan$Reset$Dim  (change: opencodeclaude plan go|zen|free, key: opencodeclaude key)$Reset"
 if ($plan -eq 'go') {
   $env:ANTHROPIC_DEFAULT_OPUS_MODEL   = $GoOpus
   $env:ANTHROPIC_DEFAULT_SONNET_MODEL = $GoSonnet
   $env:ANTHROPIC_DEFAULT_HAIKU_MODEL  = $GoHaiku
   $defaultModel = $GoSonnet
-} else {
+} elseif ($plan -eq 'zen') {
   $env:ANTHROPIC_DEFAULT_OPUS_MODEL   = $ZenOpus
   $env:ANTHROPIC_DEFAULT_SONNET_MODEL = $ZenSonnet
   $env:ANTHROPIC_DEFAULT_HAIKU_MODEL  = $ZenHaiku
   $defaultModel = $ZenSonnet
+} else {
+  $freeModel = 'deepseek-v4-flash-free'
+  $env:ANTHROPIC_DEFAULT_OPUS_MODEL   = $freeModel
+  $env:ANTHROPIC_DEFAULT_SONNET_MODEL = $freeModel
+  $env:ANTHROPIC_DEFAULT_HAIKU_MODEL  = $freeModel
+  $defaultModel = $freeModel
 }
 
 # --- proxy -----------------------------------------------------------------
@@ -309,8 +323,8 @@ try {
 
   # --- launch ----------------------------------------------------------------
   $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:$Port"
-  $env:ANTHROPIC_API_KEY  = $key
-  $env:ANTHROPIC_AUTH_TOKEN = $key
+  $env:ANTHROPIC_API_KEY  = if ($freeMode) { 'opencode-free' } else { $key }
+  $env:ANTHROPIC_AUTH_TOKEN = $env:ANTHROPIC_API_KEY
   $env:ANTHROPIC_MODEL    = $defaultModel
   $env:CLAUDE_CODE_SUBAGENT_MODEL = $env:ANTHROPIC_DEFAULT_HAIKU_MODEL
   $env:CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT = '1'

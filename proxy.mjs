@@ -20,7 +20,7 @@ const ZEN_ANTHROPIC = 'https://opencode.ai/zen/v1/messages';
 const ZEN_OPENAI_FREE = 'https://opencode.ai/zen/v1/chat/completions';
 const GO_OPENAI = 'https://opencode.ai/zen/go/v1/chat/completions';
 const ZEN_OPENAI = 'https://opencode.ai/zen/v1/chat/completions';
-const OPENAI = PLAN === 'go' ? GO_OPENAI : ZEN_OPENAI;
+const OPENAI = PLAN === 'free' ? ZEN_OPENAI_FREE : (PLAN === 'go' ? GO_OPENAI : ZEN_OPENAI);
 
 const MODELS = [
   'claude-opus-4-8', 'claude-sonnet-4-6', 'claude-sonnet-5', 'claude-haiku-4-5',
@@ -112,6 +112,12 @@ export function toOpenAI(body) {
       continue;
     }
     messages.push(m);
+  }
+  // OpenAI rejects a trailing assistant tool_calls with no following tool results.
+  const last = messages[messages.length - 1];
+  if (last?.role === 'assistant' && last.tool_calls) {
+    delete last.tool_calls;
+    if (!last.content) messages.pop();
   }
   const openai = { model: body.model, messages };
   if (body.max_tokens) openai.max_tokens = body.max_tokens;
@@ -262,9 +268,15 @@ async function handleMessages(req, res) {
   }
 
   const openaiBody = toOpenAI(body);
+  const isFree = r.url === ZEN_OPENAI_FREE;
+  const token = isFree ? 'public' : keyFor(r.url); // free endpoint accepts the dummy 'public' bearer (no account)
   const upstream = await fetch(r.url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${keyFor(r.url)}` },
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${token}`,
+      ...(isFree ? { 'x-opencode-client': 'desktop' } : {}),
+    },
     body: JSON.stringify(openaiBody),
   });
 
@@ -299,11 +311,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === 'POST' && url.pathname === '/v1/messages') {
-      if (!goKey() && !zenKey()) {
-        res.writeHead(401, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ type: 'error', error: { type: 'auth_error', message: 'no OpenCode API key set' } }));
-        return;
-      }
       await handleMessages(req, res);
       return;
     }
