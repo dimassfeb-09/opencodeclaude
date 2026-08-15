@@ -188,12 +188,16 @@ if ($args.Count -ge 1) {
       # Stop any proxy still running.
       $stalePid = Get-ListenerPid $Port
       if ($stalePid) { Stop-Process -Id $stalePid -Force -ErrorAction SilentlyContinue }
-      # Remove shims (Windows).
+      # Remove shims (Windows). Deferred to a detached process: the .cmd shim
+      # may be the very batch file running this script, and deleting it while
+      # cmd.exe is executing it produces "The batch file cannot be found."
       if ($IsWindows) {
-        foreach ($shim in @("$env:APPDATA\npm\opencodeclaude.cmd",
-                            "$env:LOCALAPPDATA\Microsoft\WindowsApps\opencodeclaude.cmd")) {
-          Remove-Item -Force $shim -ErrorAction SilentlyContinue
-        }
+        $shims = @("$env:APPDATA\npm\opencodeclaude.cmd",
+                   "$env:LOCALAPPDATA\Microsoft\WindowsApps\opencodeclaude.cmd")
+        $cmd = 'Start-Sleep -Milliseconds 1000; ' + (($shims | ForEach-Object {
+                 "Remove-Item -Force -LiteralPath '$_' -ErrorAction SilentlyContinue"
+               }) -join '; ')
+        Start-Process pwsh -ArgumentList '-NoProfile', '-Command', $cmd -WindowStyle Hidden | Out-Null
       }
       # Remove installed program dir, but only the install location - never the source folder.
       $installRoots = @()
