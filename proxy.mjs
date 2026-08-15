@@ -1,20 +1,92 @@
 // opencodeclaude proxy - Anthropic Messages <-> OpenAI Chat Completions.
 // Routes Claude/Qwen models -> Zen /v1/messages (native pass-through, x-api-key auth)
-// Routes everything else -> Go or Zen /v1/chat/completions (translated, Bearer auth)
+// Routes everything else -> Go, Zen or free /v1/chat/completions (translated, Bearer auth)
+// *-free models -> free endpoint with the dummy 'public' bearer (no account needed).
+// Sends x-opencode-* identity headers + a conversation-stable session id (per 9router),
+// and injects reasoning_content for reasoning models (Kimi/DeepSeek).
 //
 // Env: OPENCODE_API_KEY (fallback), OPENCODE_GO_KEY / OPENCODE_ZEN_KEY (optional per-plan),
-//      OPENCODE_PLAN (go|zen, default go), PORT (default 3456)
+//      OPENCODE_PLAN (free|go|zen, default go), PORT (default 3456)
 
 import http from 'node:http';
 import { URL, fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
 
 const PORT = Number(process.env.PORT || 3456);
 const KEY = process.env.OPENCODE_API_KEY || '';
-const PLAN = process.env.OPENCODE_PLAN === 'zen' ? 'zen' : 'go';
+const PLAN = process.env.OPENCODE_PLAN === 'free' ? 'free' : (process.env.OPENCODE_PLAN === 'zen' ? 'zen' : 'go');
 
 const goKey = () => process.env.OPENCODE_GO_KEY || KEY;
 const zenKey = () => process.env.OPENCODE_ZEN_KEY || KEY;
 export const keyFor = (url) => (url.includes('/zen/go/') ? goKey() : zenKey());
+
+// --- opencode upstream identity (learned from 9router's opencode executor) ---
+const OPENCODE_UA = 'opencode';
+// Claude Code embeds its per-session id in metadata.user_id as _session_<uuid>
+const CLAUDE_CODE_SESSION_RE = /_session_([a-f0-9-]+)$/i;
+
+function headerValue(headers, ...keys) {
+  if (!headers) return null;
+  for (const k of keys) {
+    const v = headers[k] ?? headers[k.toLowerCase()];
+    if (v && typeof v === 'string') return v.trim();
+  }
+  return null;
+}
+
+// Resolve a conversation-stable opencode session id (ses_<hex>) from the inbound request.
+// Priority: existing x-opencode-session → Claude Code _session_ → session headers → none.
+// A stable session id tells opencode.ai the request is a continuation of one conversation
+// (prompt caching / rate-limit friendliness), mirroring 9router's sessionManager.
+export function resolveSessionId(body, headers) {
+  const existing = headerValue(headers, 'x-opencode-session');
+  if (existing) return existing;
+  const userId = body?.metadata?.user_id;
+  if (typeof userId === 'string' && userId) {
+    const m = userId.match(CLAUDE_CODE_SESSION_RE);
+    if (m) return `ses_${m[1].replace(/-/g, '')}`;
+    if (userId.startsWith('{')) {
+      try {
+        const sid = JSON.parse(userId)?.session_id;
+        if (sid) return `ses_${String(sid).replace(/[^a-zA-Z0-9]/g, '')}`;
+      } catch {}
+    }
+  }
+  const sid = headerValue(headers, 'x-session-id', 'session-id', 'session_id', 'x-client-request-id');
+  if (sid) return `ses_${sid.replace(/[^a-zA-Z0-9]/g, '')}`;
+  return null;
+}
+
+// Headers that make opencode.ai treat us as a real opencode client. The free /zen/v1
+// endpoint accepts the dummy 'public' bearer; a stable session enables continuity.
+// If the downstream client already identifies as opencode, forward its identity untouched.
+export function buildOpencodeHeaders(req, sessionId, streaming) {
+  const h = req?.headers || {};
+  const downstreamUa = h['user-agent'] || '';
+  const isOpencodeDownstream = downstreamUa.toLowerCase().includes('opencode');
+  return {
+    'x-opencode-client': h['x-opencode-client'] || 'desktop',
+    'x-opencode-session': h['x-opencode-session'] || sessionId || `ses_${crypto.randomUUID().replace(/-/g, '')}`,
+    'x-opencode-request': h['x-opencode-request'] || `msg_${crypto.randomUUID().replace(/-/g, '')}`,
+    'x-opencode-project': h['x-opencode-project'] || 'global',
+    'User-Agent': isOpencodeDownstream ? downstreamUa : OPENCODE_UA,
+    Accept: streaming ? 'text/event-stream' : '*/*',
+  };
+}
+
+// Some reasoning models (Kimi, DeepSeek, ...) require reasoning_content echoed back on
+// assistant messages; Claude Code never sends it, so inject a placeholder to satisfy
+// upstream validation (mirrors 9router's reasoningContentInjector).
+export function injectReasoning(messages, model) {
+  const rule = /^kimi-/i.test(model) ? 'toolCalls' : (/deepseek/i.test(model) ? 'all' : null);
+  if (!rule || !Array.isArray(messages)) return messages;
+  return messages.map((m) => {
+    if (m?.role !== 'assistant') return m;
+    if (typeof m.reasoning_content === 'string' && m.reasoning_content.length > 0) return m;
+    if (rule === 'toolCalls' && !(Array.isArray(m.tool_calls) && m.tool_calls.length)) return m;
+    return { ...m, reasoning_content: ' ' };
+  });
+}
 
 const ZEN_ANTHROPIC = 'https://opencode.ai/zen/v1/messages';
 const ZEN_OPENAI_FREE = 'https://opencode.ai/zen/v1/chat/completions';
@@ -253,13 +325,18 @@ async function handleMessages(req, res) {
   const r = route(body.model);
   body.model = r.model;
 
+  // Conversation-stable session id for opencode continuity across turns.
+  const sessionId = resolveSessionId(body, req.headers);
+
   if (r.kind === 'anthropic') {
+    const streaming = body.stream !== false;
     const upstream = await fetch(r.url, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
         'x-api-key': zenKey(),
+        ...buildOpencodeHeaders(req, sessionId, streaming),
       },
       body: JSON.stringify(body),
     });
@@ -268,19 +345,21 @@ async function handleMessages(req, res) {
   }
 
   const openaiBody = toOpenAI(body);
+  openaiBody.messages = injectReasoning(openaiBody.messages, r.model);
   const isFree = r.url === ZEN_OPENAI_FREE;
   const token = isFree ? 'public' : keyFor(r.url); // free endpoint accepts the dummy 'public' bearer (no account)
+  const streaming = openaiBody.stream !== false;
   const upstream = await fetch(r.url, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       authorization: `Bearer ${token}`,
-      ...(isFree ? { 'x-opencode-client': 'desktop' } : {}),
+      ...buildOpencodeHeaders(req, sessionId, streaming),
     },
     body: JSON.stringify(openaiBody),
   });
 
-  if (openaiBody.stream && upstream.status === 200) {
+  if (streaming && upstream.status === 200) {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     await translateStream(upstream.body, res, body.model);
   } else {

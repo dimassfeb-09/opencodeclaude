@@ -1,6 +1,6 @@
 // opencodeclaude proxy self-check: node test.mjs
 import assert from 'node:assert';
-import { toOpenAI, fromOpenAI, translateStream, route, countTokens, keyFor } from './proxy.mjs';
+import { toOpenAI, fromOpenAI, translateStream, route, countTokens, keyFor, resolveSessionId, buildOpencodeHeaders, injectReasoning } from './proxy.mjs';
 
 process.env.OPENCODE_GO_KEY = 'sk-go-test';
 process.env.OPENCODE_ZEN_KEY = 'sk-zen-test';
@@ -90,5 +90,52 @@ assert.strictEqual(events[9].type, 'message_stop');
 
 // countTokens
 assert.ok(countTokens({ messages: [{ content: 'abcd' }] }).input_tokens === 1);
+
+// resolveSessionId: Claude Code _session_<uuid> → ses_<hex> (conversation-stable)
+assert.strictEqual(
+  resolveSessionId({ metadata: { user_id: '_session_1234abcd-efef' } }, {}),
+  'ses_1234abcdefef'
+);
+// x-opencode-session header passthrough wins
+assert.strictEqual(
+  resolveSessionId({ metadata: { user_id: '_session_0000' } }, { 'x-opencode-session': 'ses_custom' }),
+  'ses_custom'
+);
+// JSON metadata.session_id
+assert.strictEqual(
+  resolveSessionId({ metadata: { user_id: '{"session_id":"a1b2"}' } }, {}),
+  'ses_a1b2'
+);
+// session headers fallback
+assert.strictEqual(resolveSessionId({}, { 'x-session-id': 'abc-def' }), 'ses_abcdef');
+assert.strictEqual(resolveSessionId({}, {}), null);
+
+// buildOpencodeHeaders: opencode identity on every route, UA forwarded when downstream is opencode
+const h = buildOpencodeHeaders({ headers: { 'user-agent': 'opencode/0.20.1', 'x-opencode-project': 'proj' } }, 'ses_abc', true);
+assert.strictEqual(h['x-opencode-client'], 'desktop');
+assert.strictEqual(h['x-opencode-session'], 'ses_abc');
+assert.strictEqual(h['x-opencode-project'], 'proj');
+assert.strictEqual(h['User-Agent'], 'opencode/0.20.1');
+assert.strictEqual(h.Accept, 'text/event-stream');
+// non-opencode downstream → masquerade as opencode
+assert.strictEqual(buildOpencodeHeaders({}, null, false)['User-Agent'], 'opencode');
+assert.strictEqual(buildOpencodeHeaders({}, null, false).Accept, '*/*');
+// session generated when none resolvable
+assert.match(buildOpencodeHeaders({}, null, true)['x-opencode-session'], /^ses_[0-9a-f]+$/);
+
+// injectReasoning: deepseek → every assistant, kimi → only tool_calls assistants, others untouched
+assert.deepStrictEqual(
+  injectReasoning([{ role: 'user', content: 'x' }, { role: 'assistant', content: 'y' }], 'deepseek-v4-flash-free'),
+  [{ role: 'user', content: 'x' }, { role: 'assistant', content: 'y', reasoning_content: ' ' }]
+);
+assert.strictEqual(
+  injectReasoning([{ role: 'assistant', content: 'y', tool_calls: [{ id: 't' }] }], 'kimi-k3')[0].reasoning_content,
+  ' '
+);
+assert.strictEqual(
+  injectReasoning([{ role: 'assistant', content: 'y' }], 'kimi-k3')[0].reasoning_content,
+  undefined
+);
+assert.deepStrictEqual(injectReasoning([{ role: 'user', content: 'x' }], 'glm-5.2'), [{ role: 'user', content: 'x' }]);
 
 console.log('all proxy tests passed');

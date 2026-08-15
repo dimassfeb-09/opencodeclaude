@@ -1,11 +1,12 @@
 # opencodeclaude - Documentation
 
-Run [Claude Code](https://docs.claude.com/en/docs/claude-code) against **both OpenCode plans**:
+Run [Claude Code](https://docs.claude.com/en/docs/claude-code) against **all OpenCode plans**:
 
+- **OpenCode Free** - no account, no key, free models only (e.g. `deepseek-v4-flash-free`)
 - **OpenCode Zen** - pay-as-you-go (Claude, Qwen, GPT, DeepSeek, Kimi, GLM, ...)
 - **OpenCode Go** - flat fee (Kimi, DeepSeek, GLM, MiniMax, Qwen, ...)
 
-One command, paste your key once, everything else just works. A local wrapper starts a proxy, sets the env vars, and launches `claude`.
+One command, paste your key once (or pick `free`), everything else just works. A local wrapper starts a proxy, sets the env vars, and launches `claude`.
 
 > Prerequisites: the `claude` CLI and Node.js 20+.
 
@@ -28,8 +29,8 @@ One command, paste your key once, everything else just works. A local wrapper st
 Claude Code normally needs an Anthropic API key. This project lets you run the official Claude Code CLI on an **OpenCode** subscription instead:
 
 - Free your coding sessions from Anthropic billing
-- One key covers both OpenCode plans
-- Pick from all 88 Go + Zen models inside Claude Code's own `/model` picker
+- One key covers both paid plans - or go **fully free** with no key at all
+- Pick from all Go + Zen models inside Claude Code's own `/model` picker
 
 No patching, no fork - the CLI stays official and untouched.
 
@@ -43,13 +44,14 @@ flowchart LR
     C -->|"Anthropic Messages"| P["proxy.mjs<br/>(localhost:3456)<br/>translation + routing"]
     P --> G["Go OpenAI API<br/>/zen/go/v1/chat/completions"]
     P --> ZO["Zen OpenAI API<br/>/zen/v1/chat/completions"]
+    P --> ZF["Free OpenAI API<br/>/zen/v1/chat/completions<br/>Bearer public, no key"]
     P --> ZA["Zen Anthropic API<br/>/zen/v1/messages"]
 ```
 
 Two pieces:
 
 1. **Wrapper** (`opencodeclaude.ps1`) - resolves your key/plan, starts the proxy, sets the env vars, launches `claude`, then tears the proxy down when `claude` exits. Any stale proxy on the port is killed first, so you always run current code.
-2. **Proxy** (`proxy.mjs`) - a single-file, zero-dependency Node server. Claude Code only speaks the **Anthropic Messages** format, but every Go-plan model is **OpenAI-format only**. The proxy translates between the two and routes each request to the right endpoint.
+2. **Proxy** (`proxy.mjs`) - a single-file, zero-dependency Node server. Claude Code only speaks the **Anthropic Messages** format, but every Go-plan model is **OpenAI-format only**. The proxy translates between the two and routes each request to the right endpoint. It also sends the `x-opencode-*` identity headers and a conversation-stable session id that make opencode.ai treat requests as coming from a real opencode client (mirroring how [9router](https://github.com/decolua/9router) connects to OpenCode Free), and injects `reasoning_content` for reasoning models (DeepSeek/Kimi).
 
 ### Proxy endpoints
 
@@ -69,8 +71,8 @@ Default port: `3456`.
 |---|---|---|
 | `claude-*` | Zen `/zen/v1/messages` | native Anthropic, `x-api-key`, pass-through |
 | `qwen3*` | Zen `/zen/v1/messages` | native Anthropic (unless forced to `go`) |
-| `*-free` | Zen `/zen/v1/chat/completions` | free tier, OpenAI format |
-| others | Go `/zen/go/v1/chat/completions` or Zen `/zen/v1/chat/completions` | depends on plan / prefix |
+| `*-free` | Zen `/zen/v1/chat/completions` | free tier, OpenAI format, `Bearer public` (no key) |
+| others | Go `/zen/go/v1/chat/completions`, Zen `/zen/v1/chat/completions`, or free `/zen/v1/chat/completions` | depends on plan / prefix |
 
 The endpoint prefix overrides the plan: `anthropic-go/<id>` -> Go, `anthropic-zen/<id>` -> Zen, no prefix -> the plan default. The old `opencode-go/` and `opencode-zen/` prefixes are still accepted (backward compatibility). The proxy strips the prefix and forwards the real id upstream.
 
@@ -88,8 +90,8 @@ ANTHROPIC_DEFAULT_HAIKU_MODEL   = <haiku tier per plan>
 CLAUDE_CODE_SUBAGENT_MODEL      = <haiku tier per plan>
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = 1
 CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT = 1
-OPENCODE_API_KEY                = <passed to the proxy>
-OPENCODE_PLAN                   = <passed to the proxy>
+OPENCODE_API_KEY                = <passed to the proxy (empty on the free plan)>
+OPENCODE_PLAN                   = free|go|zen (default: go)
 ```
 
 ---
@@ -144,10 +146,21 @@ Set-Alias opencodeclaude "F:\Project\opencodeclaude\opencodeclaude.ps1"
 
 The first time you run `opencodeclaude`, it asks two things:
 
-1. **Choose the plan** - `1` = go, `2` = zen (default: go)
-2. **Enter your OpenCode API key** - get one at https://opencode.ai/auth
+1. **Choose the plan** - `1` = go, `2` = zen, `3` = free (default: go)
+2. **Enter your OpenCode API key** - get one at https://opencode.ai/auth *(only for go/zen; the free plan needs no key)*
 
 Everything is saved to `%APPDATA%\opencodeclaude\config` (or `~/.config/opencodeclaude/config` on Linux/macOS) with restrictive permissions. Every run after that just works.
+
+### Going fully free
+
+No account, no key, no billing - just free models:
+
+```powershell
+opencodeclaude plan free
+opencodeclaude
+```
+
+The free plan runs on the opencode **`/zen/v1`** endpoint with the dummy `public` bearer token, using whichever free models opencode currently offers (auto-fetched by the proxy from `/zen/v1/models`). Model availability fluctuates over time and is subject to rate limits.
 
 ### Managing the key and plan
 
@@ -157,7 +170,7 @@ Key resolution order: **config file -> env var `OPENCODE_API_KEY` -> interactive
 |---|---|
 | `opencodeclaude config` | change key (interactive) |
 | `opencodeclaude config <KEY>` | change key inline |
-| `opencodeclaude plan go\|zen` | choose which plan's OpenAI endpoint to use |
+| `opencodeclaude plan go\|zen\|free` | choose which plan's endpoint to use (free needs no key) |
 | `opencodeclaude plan` | show the active plan |
 | `opencodeclaude reset` | delete the stored key |
 
@@ -171,6 +184,7 @@ opencodeclaude "refactor this module"   # one-shot prompt
 opencodeclaude --model kimi-k3          # override the default model
 opencodeclaude --model anthropic-zen/claude-opus-4-8   # endpoint-specific model
 opencodeclaude plan zen                 # switch plan
+opencodeclaude plan free                # no key needed - free models only
 ```
 
 CLI arguments are passed straight through to `claude`, so all `claude` flags still apply.
@@ -206,11 +220,11 @@ Any model id works, even ones not shown in the picker.
 
 The Default / Opus / Sonnet / Haiku tiers resolve to:
 
-| Tier | Go plan | Zen plan |
-|---|---|---|
-| Opus (thinking) | `deepseek-v4-flash` | `claude-opus-4-8` |
-| Sonnet (default) | `deepseek-v4-flash` | `claude-sonnet-4-6` |
-| Haiku (subagent) | `deepseek-v4-flash` | `claude-haiku-4-5` |
+| Tier | Go plan | Zen plan | Free plan |
+|---|---|---|---|
+| Opus (thinking) | `deepseek-v4-flash` | `claude-opus-4-8` | `deepseek-v4-flash-free` |
+| Sonnet (default) | `deepseek-v4-flash` | `claude-sonnet-4-6` | `deepseek-v4-flash-free` |
+| Haiku (subagent) | `deepseek-v4-flash` | `claude-haiku-4-5` | `deepseek-v4-flash-free` |
 
 ### Why does the picker show only a handful? - and why the "Gateway" label
 
@@ -261,6 +275,8 @@ Remove-Item -Recurse -Force "$env:APPDATA\opencodeclaude"   # stored key + plan
 | "Gateway" section label | hardcoded Claude Code text | normal, not a bug |
 | `403 RegionError` on `deepseek-v4-flash` | China-hosted model needs opt-in | enable at https://opencode.ai/workspace/.../go |
 | `429 FreeUsageLimitError` on `*-free` | free tier rate limit | wait, or switch to a paid model |
+| free plan shows only `*-free` models | free models are a subset of the catalog | opencode decides what's free; the list changes over time |
+| `401` on a `*-free` model | free model dropped from the promo | pick another free model, or use the go/zen plan |
 | `401 Insufficient balance` on Zen | empty Zen balance | top up billing, or use the Go plan |
 | "Unknown model" error | model name typo | `/model <id>` with the exact id from `/v1/models` |
 | Port 3456 held by a stale proxy | previous process did not exit | the wrapper kills it automatically at launch |
