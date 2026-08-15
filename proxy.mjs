@@ -64,17 +64,26 @@ export function resolveSessionId(body, headers) {
   return null;
 }
 
+// A deterministic per-(session, model) request key: same conversation + same model
+// always produces the same msg_ id, so upstream request caching / dedup keys don't
+// churn between turns (and identical retries reuse the same id). Falls back to a
+// random id only when there is no session to anchor on.
+export function requestKey(sessionId, model) {
+  if (sessionId) return `msg_${crypto.createHash('sha1').update(`${sessionId}:${model || ''}`).digest('hex').slice(0, 24)}`;
+  return `msg_${crypto.randomUUID().replace(/-/g, '')}`;
+}
+
 // Headers that make opencode.ai treat us as a real opencode client. The free /zen/v1
 // endpoint accepts the dummy 'public' bearer; a stable session enables continuity.
 // If the downstream client already identifies as opencode, forward its identity untouched.
-export function buildOpencodeHeaders(req, sessionId, streaming) {
+export function buildOpencodeHeaders(req, sessionId, model, streaming) {
   const h = req?.headers || {};
   const downstreamUa = h['user-agent'] || '';
   const isOpencodeDownstream = downstreamUa.toLowerCase().includes('opencode');
   return {
     'x-opencode-client': h['x-opencode-client'] || 'desktop',
     'x-opencode-session': h['x-opencode-session'] || sessionId || `ses_${crypto.randomUUID().replace(/-/g, '')}`,
-    'x-opencode-request': h['x-opencode-request'] || `msg_${crypto.randomUUID().replace(/-/g, '')}`,
+    'x-opencode-request': h['x-opencode-request'] || requestKey(sessionId, model),
     'x-opencode-project': h['x-opencode-project'] || 'global',
     'User-Agent': isOpencodeDownstream ? downstreamUa : OPENCODE_UA,
     Accept: streaming ? 'text/event-stream' : '*/*',
@@ -241,10 +250,15 @@ export function fromOpenAI(data) {
     try { input = JSON.parse(tc.function?.arguments || '{}'); } catch {}
     content.push({ type: 'tool_use', id: tc.id, name: tc.function?.name || '', input });
   }
+  const cached = data.usage?.prompt_tokens_details?.cached_tokens || 0;
   return {
     id: data.id, type: 'message', role: 'assistant', model: data.model, content,
     stop_reason: finishMap[choice.finish_reason] || 'end_turn', stop_sequence: null,
-    usage: { input_tokens: data.usage?.prompt_tokens || 0, output_tokens: data.usage?.completion_tokens || 0 },
+    usage: {
+      input_tokens: data.usage?.prompt_tokens || 0,
+      output_tokens: data.usage?.completion_tokens || 0,
+      ...(cached ? { cache_read_input_tokens: cached } : {}),
+    },
   };
 }
 
@@ -405,25 +419,80 @@ export function extractUsage(text, contentType) {
   return { usage, toolCalls };
 }
 
-async function forward(upstream, res, headers) {
+// Stream the Claude (native Anthropic) response through to the client. For SSE we
+// pipe chunks straight through (real streaming, unlike buffering the whole body)
+// while scraping usage/tool counts from the passing data; the forward headers are
+// applied first. On abort or upstream failure the response is ended immediately.
+async function forwardStreaming(upstream, res, headers) {
   const ct = upstream.headers.get('content-type') || 'application/json';
-  let body;
-  try {
-    body = await upstream.text();
-  } catch {
-    if (!res.headersSent && !res.destroyed) res.writeHead(502, { 'content-type': 'application/json' });
-    res.end();
-    return { status: 502, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, toolCalls: 0, aborted: true };
-  }
+  const isSse = /text\/event-stream/i.test(ct);
+
   if (upstream.status >= 400) {
-    res.writeHead(upstream.status, { 'content-type': ct });
-    res.end(body);
+    const body = await upstream.text().catch(() => '');
+    if (!res.headersSent && !res.destroyed) res.writeHead(upstream.status, { 'content-type': 'application/json' });
+    try { res.end(errorToAnthropic(upstream.status, body)); } catch {}
     return { ...extractUsage(body, ct), status: upstream.status, aborted: false };
   }
-  res.writeHead(upstream.status, { 'content-type': ct, ...headers });
-  res.write(body, upstream.status !== 200 ? undefined : undefined);
-  res.end();
-  return { ...extractUsage(body, ct), status: upstream.status, aborted: false };
+
+  if (!isSse || !upstream.body) {
+    // Non-streaming or empty body: buffer as before.
+    let body;
+    try {
+      body = await upstream.text();
+    } catch {
+      if (!res.headersSent && !res.destroyed) res.writeHead(502, { 'content-type': 'application/json' });
+      res.end();
+      return { status: 502, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, toolCalls: 0, aborted: true };
+    }
+    if (!res.headersSent && !res.destroyed) res.writeHead(upstream.status, { 'content-type': ct, ...headers });
+    try { res.end(body); } catch {}
+    return { ...extractUsage(body, ct), status: upstream.status, aborted: false };
+  }
+
+  // Pipe SSE while accumulating usage/toolCalls from the byte stream.
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  let toolCalls = 0;
+  if (!res.headersSent && !res.destroyed) res.writeHead(upstream.status, { 'content-type': ct, ...headers });
+  const rd = upstream.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  let aborted = false;
+  try {
+    while (true) {
+      const { done, value } = await rd.read();
+      if (done) break;
+      const chunk = dec.decode(value, { stream: true });
+      buf += chunk;
+      // Scrape usage/tool events as they pass; also stop buffering the tail once
+      // message_stop is seen (keeps buf small on long generations).
+      let lineStart = 0;
+      let nl;
+      while ((nl = buf.indexOf('\n', lineStart)) >= 0) {
+        const line = buf.slice(lineStart, nl);
+        lineStart = nl + 1;
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        let d;
+        try { d = JSON.parse(payload); } catch { continue; }
+        if (d.type === 'content_block_start' && d.content_block?.type === 'tool_use') toolCalls++;
+        if (d.type === 'message_start' && d.message?.usage) {
+          usage.input = d.message.usage.input_tokens || 0;
+          usage.output = d.message.usage.output_tokens || 0;
+          usage.cacheRead = d.message.usage.cache_read_input_tokens || 0;
+          usage.cacheWrite = d.message.usage.cache_creation_input_tokens || 0;
+        }
+        if (d.type === 'message_delta' && d.usage && typeof d.usage.output_tokens === 'number') usage.output = d.usage.output_tokens;
+      }
+      if (buf.indexOf('\n', lineStart) < 0) buf = buf.slice(lineStart); else buf = '';
+      if (res.destroyed || res.writableEnded) { aborted = true; break; }
+      try { res.write(chunk); } catch { aborted = true; break; }
+    }
+  } catch {
+    aborted = true;
+  }
+  try { res.end(); } catch {}
+  return { status: aborted ? 502 : upstream.status, usage, toolCalls, aborted };
 }
 
 // Normalize {input,output,cacheRead,cacheWrite} usage into the log record keys
@@ -504,13 +573,13 @@ async function handleMessages(req, res) {
           'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
           ...(beta ? { 'anthropic-beta': beta } : {}),
           'x-api-key': zenKey(),
-          ...buildOpencodeHeaders(req, sessionId, streaming),
+          ...buildOpencodeHeaders(req, sessionId, r.model, streaming),
         },
         body: JSON.stringify(body),
         signal: guard.controller.signal,
       });
       guard.clearTimer();
-      const f = await forward(upstream, res);
+      const f = await forwardStreaming(upstream, res);
       finish({ status: f.status, ...usagePatch(f.usage), toolCalls: f.toolCalls, error: f.aborted ? 'aborted' : null });
       return;
     }
@@ -525,7 +594,7 @@ async function handleMessages(req, res) {
       headers: {
         'content-type': 'application/json',
         authorization: `Bearer ${token}`,
-        ...buildOpencodeHeaders(req, sessionId, streaming),
+        ...buildOpencodeHeaders(req, sessionId, r.model, streaming),
       },
       body: JSON.stringify(openaiBody),
       signal: guard.controller.signal,

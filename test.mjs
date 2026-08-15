@@ -1,6 +1,6 @@
 // opencodeclaude proxy self-check: node test.mjs
 import assert from 'node:assert';
-import { toOpenAI, fromOpenAI, translateStream, route, countTokens, keyFor, resolveSessionId, buildOpencodeHeaders, injectReasoning, filteredBeta, extractUsage, usagePatch, errorToAnthropic } from './proxy.mjs';
+import { toOpenAI, fromOpenAI, translateStream, route, countTokens, keyFor, resolveSessionId, buildOpencodeHeaders, injectReasoning, filteredBeta, extractUsage, usagePatch, errorToAnthropic, requestKey } from './proxy.mjs';
 
 process.env.OPENCODE_GO_KEY = 'sk-go-test';
 process.env.OPENCODE_ZEN_KEY = 'sk-zen-test';
@@ -80,6 +80,16 @@ const an = fromOpenAI({
 assert.strictEqual(an.stop_reason, 'tool_use');
 assert.deepStrictEqual(an.content[0], { type: 'tool_use', id: 't2', name: 'bash', input: { command: 'ls' } });
 
+// fromOpenAI: cached_tokens forwarded as cache_read_input_tokens; absent when 0
+const anC = fromOpenAI({
+  id: 'x2', model: 'kimi-k3', usage: { prompt_tokens: 100, completion_tokens: 4, prompt_tokens_details: { cached_tokens: 80 } },
+  choices: [{ finish_reason: 'stop', message: { content: 'ok' } }],
+});
+assert.strictEqual(anC.usage.cache_read_input_tokens, 80);
+assert.strictEqual(anC.usage.input_tokens, 100);
+const anNoC = fromOpenAI({ id: 'x3', model: 'kimi-k3', usage: { prompt_tokens: 5, completion_tokens: 1 }, choices: [{ finish_reason: 'stop', message: { content: 'ok' } }] });
+assert.strictEqual(anNoC.usage.cache_read_input_tokens, undefined);
+
 // translateStream: text delta then tool call then finish
 const res = fakeRes();
 const sse = [
@@ -126,17 +136,27 @@ assert.strictEqual(resolveSessionId({}, { 'x-session-id': 'abc-def' }), 'ses_abc
 assert.strictEqual(resolveSessionId({}, {}), null);
 
 // buildOpencodeHeaders: opencode identity on every route, UA forwarded when downstream is opencode
-const h = buildOpencodeHeaders({ headers: { 'user-agent': 'opencode/0.20.1', 'x-opencode-project': 'proj' } }, 'ses_abc', true);
+const h = buildOpencodeHeaders({ headers: { 'user-agent': 'opencode/0.20.1', 'x-opencode-project': 'proj' } }, 'ses_abc', 'kimi-k3', true);
 assert.strictEqual(h['x-opencode-client'], 'desktop');
 assert.strictEqual(h['x-opencode-session'], 'ses_abc');
 assert.strictEqual(h['x-opencode-project'], 'proj');
 assert.strictEqual(h['User-Agent'], 'opencode/0.20.1');
 assert.strictEqual(h.Accept, 'text/event-stream');
 // non-opencode downstream → masquerade as opencode
-assert.strictEqual(buildOpencodeHeaders({}, null, false)['User-Agent'], 'opencode');
-assert.strictEqual(buildOpencodeHeaders({}, null, false).Accept, '*/*');
+assert.strictEqual(buildOpencodeHeaders({}, null, 'kimi-k3', false)['User-Agent'], 'opencode');
+assert.strictEqual(buildOpencodeHeaders({}, null, 'kimi-k3', false).Accept, '*/*');
 // session generated when none resolvable
-assert.match(buildOpencodeHeaders({}, null, true)['x-opencode-session'], /^ses_[0-9a-f]+$/);
+assert.match(buildOpencodeHeaders({}, null, 'kimi-k3', true)['x-opencode-session'], /^ses_[0-9a-f]+$/);
+
+// requestKey: deterministic per (session, model), stable across calls
+const k1 = requestKey('ses_abc', 'kimi-k3');
+const k2 = requestKey('ses_abc', 'kimi-k3');
+assert.strictEqual(k1, k2);
+assert.match(k1, /^msg_[0-9a-f]{24}$/);
+assert.notStrictEqual(requestKey('ses_abc', 'kimi-k3'), requestKey('ses_abc', 'deepseek-v4-flash'));
+assert.notStrictEqual(requestKey('ses_abc', 'kimi-k3'), requestKey('ses_xyz', 'kimi-k3'));
+// random when no session
+assert.match(requestKey(null, 'kimi-k3'), /^msg_[0-9a-f]+$/);
 
 // injectReasoning: deepseek → every assistant, kimi → only tool_calls assistants, others untouched
 assert.deepStrictEqual(
