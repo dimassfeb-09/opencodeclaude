@@ -178,8 +178,10 @@ export function toOpenAI(body) {
       const parts = Array.isArray(m.content) ? m.content : [{ type: 'text', text: m.content || '' }];
       const text = parts.filter((b) => b.type === 'text').map((b) => b.text || '').filter(Boolean);
       const tools = parts.filter((b) => b.type === 'tool_result');
-      if (text.length) messages.push({ role: 'user', content: text.join('\n') });
+      // OpenAI requires tool messages to immediately follow the assistant tool_calls;
+      // user text must come AFTER the tool responses, never between them.
       for (const b of tools) messages.push({ role: 'tool', tool_call_id: b.tool_use_id, content: toolResultText(b.content) });
+      if (text.length) messages.push({ role: 'user', content: text.join('\n') });
       if (!text.length && !tools.length) messages.push({ role: 'user', content: '' });
       continue;
     }

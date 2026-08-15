@@ -57,6 +57,21 @@ const d = toOpenAI({
 assert.strictEqual(d.messages.length, 1, 'dangling tool_calls message should be dropped');
 assert.deepStrictEqual(d.messages[0], { role: 'user', content: 'go' });
 
+// toOpenAI: user message with BOTH text and tool_result - tool messages must come
+// BEFORE the user text so tool responses immediately follow the assistant tool_calls.
+const c = toOpenAI({
+  model: 'kimi-k3',
+  messages: [
+    { role: 'user', content: [{ type: 'text', text: 'run it' }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't5', name: 'bash', input: { command: 'ls' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't5', content: 'out' }, { type: 'text', text: 'now do more' }] },
+  ],
+});
+assert.strictEqual(c.messages[2].role, 'tool');
+assert.strictEqual(c.messages[3].role, 'user');
+assert.deepStrictEqual(c.messages[2], { role: 'tool', tool_call_id: 't5', content: 'out' });
+assert.deepStrictEqual(c.messages[3], { role: 'user', content: 'now do more' });
+
 // fromOpenAI: non-stream completion with tool call
 const an = fromOpenAI({
   id: 'x1', model: 'kimi-k3', usage: { prompt_tokens: 10, completion_tokens: 5 },
