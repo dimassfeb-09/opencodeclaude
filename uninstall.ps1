@@ -1,5 +1,5 @@
 # uninstall.ps1 - remove opencodeclaude (Windows).
-# Run locally:  pwsh -ExecutionPolicy Bypass -File uninstall.ps1
+# Run locally:  powershell -ExecutionPolicy Bypass -File uninstall.ps1
 # Or hosted:
 #   irm https://raw.githubusercontent.com/dimassfeb-09/opencodeclaude/main/uninstall.ps1 | iex
 $ErrorActionPreference = 'SilentlyContinue'

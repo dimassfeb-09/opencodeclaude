@@ -407,5 +407,8 @@ const server = http.createServer(async (req, res) => {
 });
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  // Never let one bad request kill the proxy (Node >=15 crashes on unhandled rejections).
+  process.on('unhandledRejection', (e) => console.error('unhandled rejection:', e?.message || e));
+  process.on('uncaughtException', (e) => console.error('uncaught exception:', e?.message || e));
   server.listen(PORT, '127.0.0.1', () => console.log(`opencodeclaude proxy on http://127.0.0.1:${PORT} (plan=${PLAN})`));
 }

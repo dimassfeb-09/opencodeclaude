@@ -40,7 +40,7 @@ No patching, no fork - the CLI stays official and untouched.
 
 ```mermaid
 flowchart LR
-    W["opencodeclaude.ps1<br/>(wrapper)"] -->|"env vars"| C["claude<br/>(Claude Code CLI)"]
+    W["cli.mjs<br/>(Node wrapper)"] -->|"env vars"| C["claude<br/>(Claude Code CLI)"]
     C -->|"Anthropic Messages"| P["proxy.mjs<br/>(localhost:3456)<br/>translation + routing"]
     P --> G["Go OpenAI API<br/>/zen/go/v1/chat/completions"]
     P --> ZO["Zen OpenAI API<br/>/zen/v1/chat/completions"]
@@ -50,7 +50,7 @@ flowchart LR
 
 Two pieces:
 
-1. **Wrapper** (`opencodeclaude.ps1`) - resolves your key/plan, starts the proxy, sets the env vars, launches `claude`, then tears the proxy down when `claude` exits. Any stale proxy on the port is killed first, so you always run current code.
+1. **Wrapper** (`cli.mjs`) - a cross-platform Node script (no PowerShell/pwsh required): resolves your key/plan, starts the proxy, sets the env vars, launches `claude`, then tears the proxy down when `claude` exits. Any stale proxy on the port is killed first, so you always run current code.
 2. **Proxy** (`proxy.mjs`) - a single-file, zero-dependency Node server. Claude Code only speaks the **Anthropic Messages** format, but every Go-plan model is **OpenAI-format only**. The proxy translates between the two and routes each request to the right endpoint. It also sends the `x-opencode-*` identity headers and a conversation-stable session id that make opencode.ai treat requests as coming from a real opencode client (mirroring how [9router](https://github.com/decolua/9router) connects to OpenCode Free), and injects `reasoning_content` for reasoning models (DeepSeek/Kimi).
 
 ### Proxy endpoints
@@ -90,6 +90,7 @@ ANTHROPIC_DEFAULT_HAIKU_MODEL   = <haiku tier per plan>
 CLAUDE_CODE_SUBAGENT_MODEL      = <haiku tier per plan>
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = 1
 CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT = 1
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = 1
 OPENCODE_API_KEY                = <passed to the proxy (empty on the free plan)>
 OPENCODE_PLAN                   = free|go|zen (default: go)
 ```
@@ -101,7 +102,7 @@ OPENCODE_PLAN                   = free|go|zen (default: go)
 ### Windows
 
 ```powershell
-pwsh -ExecutionPolicy Bypass -File F:\Project\opencodeclaude\install.ps1
+powershell -ExecutionPolicy Bypass -File F:\Project\opencodeclaude\install.ps1
 ```
 
 Or hosted:
@@ -110,7 +111,7 @@ Or hosted:
 irm https://raw.githubusercontent.com/dimassfeb-09/opencodeclaude/main/install.ps1 | iex
 ```
 
-### Linux / macOS (requires `pwsh`)
+### Linux / macOS (requires Node.js)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dimassfeb-09/opencodeclaude/main/install.sh | sh
@@ -134,10 +135,14 @@ Shim:  ~/.local/bin/opencodeclaude
 
 Open a **new terminal**, then run `opencodeclaude`.
 
-No installer, just a local alias:
+No installer, just a local shim:
 
 ```powershell
-Set-Alias opencodeclaude "F:\Project\opencodeclaude\opencodeclaude.ps1"
+function opencodeclaude { node "F:\Project\opencodeclaude\cli.mjs" @args }
+```
+
+```bash
+opencodeclaude() { node "$HOME/opencodeclaude/cli.mjs" "$@"; }
 ```
 
 ---
@@ -249,7 +254,7 @@ opencodeclaude --uninstall
 Or run the uninstall script:
 
 ```powershell
-pwsh -ExecutionPolicy Bypass -File F:\Project\opencodeclaude\uninstall.ps1
+powershell -ExecutionPolicy Bypass -File F:\Project\opencodeclaude\uninstall.ps1
 ```
 
 ```bash
