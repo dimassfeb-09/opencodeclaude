@@ -1,6 +1,6 @@
 // opencodeclaude proxy self-check: node test.mjs
 import assert from 'node:assert';
-import { toOpenAI, fromOpenAI, translateStream, route, countTokens, keyFor, resolveSessionId, buildOpencodeHeaders, injectReasoning, filteredBeta, extractUsage } from './proxy.mjs';
+import { toOpenAI, fromOpenAI, translateStream, route, countTokens, keyFor, resolveSessionId, buildOpencodeHeaders, injectReasoning, filteredBeta, extractUsage, usagePatch, errorToAnthropic } from './proxy.mjs';
 
 process.env.OPENCODE_GO_KEY = 'sk-go-test';
 process.env.OPENCODE_ZEN_KEY = 'sk-zen-test';
@@ -213,5 +213,25 @@ assert.strictEqual(st3.aborted, true);
 // countTokens counts system + messages + tools
 const ct = countTokens({ system: 'ssss', messages: [{ content: 'aaaa' }], tools: [{ name: 'tttt', description: 'dddd' }] });
 assert.ok(ct.input_tokens >= 4, 'system and tools should contribute to the estimate');
+
+// usagePatch: maps {input,output,...} to log keys {in,out,...}
+assert.deepStrictEqual(usagePatch({ input: 10, output: 3, cacheRead: 2, cacheWrite: 1 }), { in: 10, out: 3, cacheRead: 2, cacheWrite: 1 });
+assert.deepStrictEqual(usagePatch({ in: 7, out: 1 }), { in: 7, out: 1, cacheRead: 0, cacheWrite: 0 });
+assert.deepStrictEqual(usagePatch(undefined), { in: 0, out: 0, cacheRead: 0, cacheWrite: 0 });
+
+// errorToAnthropic: 429 + OpenAI error body → Anthropic rate_limit_error
+assert.deepStrictEqual(JSON.parse(errorToAnthropic(429, '{"error":{"message":"limit","type":"rate_limit_error"}}')), {
+  type: 'error', error: { type: 'rate_limit_error', message: 'limit' },
+});
+assert.deepStrictEqual(JSON.parse(errorToAnthropic(500, '{"error":{"code":"svc"}}')), {
+  type: 'error', error: { type: 'api_error', message: 'svc' },
+});
+const fallback = JSON.parse(errorToAnthropic(400, 'not json'));
+assert.strictEqual(fallback.error.type, 'api_error');
+assert.ok(/400/.test(fallback.error.message));
+
+// toOpenAI: stream defaults to true
+assert.strictEqual(toOpenAI({ model: 'kimi-k3', messages: [{ role: 'user', content: 'x' }] }).stream, true);
+assert.strictEqual(toOpenAI({ model: 'kimi-k3', stream: false, messages: [{ role: 'user', content: 'x' }] }).stream, false);
 
 console.log('all proxy tests passed');

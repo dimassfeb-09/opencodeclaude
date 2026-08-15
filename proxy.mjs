@@ -218,7 +218,8 @@ export function toOpenAI(body) {
   const openai = { model: body.model, messages };
   if (body.max_tokens) openai.max_tokens = body.max_tokens;
   if (typeof body.temperature === 'number') openai.temperature = body.temperature;
-  if (body.stream !== undefined) openai.stream = body.stream;
+  // Default to streaming so a body without stream never trips the SSE reader.
+  openai.stream = body.stream ?? true;
   if (body.tools?.length) {
     openai.tools = body.tools.map((t) => ({
       type: 'function',
@@ -425,6 +426,29 @@ async function forward(upstream, res, headers) {
   return { ...extractUsage(body, ct), status: upstream.status, aborted: false };
 }
 
+// Normalize {input,output,cacheRead,cacheWrite} usage into the log record keys
+// {in,out,cacheRead,cacheWrite} so every success path fills the same columns.
+export const usagePatch = (u = {}) => ({
+  in: u.input ?? u.in ?? 0,
+  out: u.output ?? u.out ?? 0,
+  cacheRead: u.cacheRead ?? 0,
+  cacheWrite: u.cacheWrite ?? 0,
+});
+
+// Map an upstream non-2xx (OpenAI-shaped) body to the Anthropic error shape Claude
+// Code expects, so it can parse retryable statuses like 429 instead of failing.
+export function errorToAnthropic(status, body) {
+  let err = { type: 'api_error', message: `upstream error ${status}` };
+  try {
+    const d = JSON.parse(body || '{}');
+    if (d?.error) {
+      if (typeof d.error === 'string') err = { type: 'api_error', message: d.error };
+      else err = { type: d.error.type || (status === 429 ? 'rate_limit_error' : 'api_error'), message: String(d.error.message || d.error.code || err.message) };
+    }
+  } catch {}
+  return JSON.stringify({ type: 'error', error: err });
+}
+
 // One JSON line per handled request. Never logs the body, Authorization, or keys.
 export function logRequest(rec) {
   try { console.log(JSON.stringify(rec)); } catch {}
@@ -440,10 +464,12 @@ function abortGuard(req, res) {
   return { controller, clearTimer: () => clearTimeout(timer) };
 }
 
+// Provider label for the log. Distinguish free by the model suffix, not the URL
+// (ZEN_OPENAI and ZEN_OPENAI_FREE share the same path).
 const routeLabel = (r) => {
   if (r.kind === 'anthropic') return 'zen-messages';
+  if (/-free$/.test(r.model)) return 'free';
   if (r.url.includes('/go/')) return 'go';
-  if (r.url === ZEN_OPENAI_FREE) return 'free';
   return 'zen';
 };
 
@@ -485,7 +511,7 @@ async function handleMessages(req, res) {
       });
       guard.clearTimer();
       const f = await forward(upstream, res);
-      finish({ status: f.status, ...f.usage, toolCalls: f.toolCalls, error: f.aborted ? 'aborted' : null });
+      finish({ status: f.status, ...usagePatch(f.usage), toolCalls: f.toolCalls, error: f.aborted ? 'aborted' : null });
       return;
     }
 
@@ -509,7 +535,7 @@ async function handleMessages(req, res) {
     if (streaming && upstream.status === 200) {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       const st = await translateStream(upstream.body, res, body.model, { inputEstimate: countTokens(body).input_tokens });
-      finish({ status: 200, ...st.usage, toolCalls: st.toolCalls, error: st.aborted ? 'aborted' : null });
+      finish({ status: 200, ...usagePatch(st.usage), toolCalls: st.toolCalls, error: st.aborted ? 'aborted' : null });
     } else {
       let data;
       try {
@@ -529,8 +555,8 @@ async function handleMessages(req, res) {
         const det = u.prompt_tokens_details;
         finish({ status: 200, in: u.prompt_tokens || 0, out: u.completion_tokens || 0, cacheRead: det?.cached_tokens || 0, cacheWrite: 0, toolCalls: (parsed?.choices?.[0]?.message?.tool_calls || []).length });
       } else {
-        res.writeHead(status, { 'content-type': upstream.headers.get('content-type') || 'application/json' });
-        res.end(data);
+        res.writeHead(status, { 'content-type': 'application/json' });
+        res.end(errorToAnthropic(status, data));
         finish({ status, error: `upstream_${status}` });
       }
     }
