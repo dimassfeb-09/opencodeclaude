@@ -1,6 +1,6 @@
 // opencodeclaude proxy self-check: node test.mjs
 import assert from 'node:assert';
-import { toOpenAI, fromOpenAI, translateStream, route, countTokens, keyFor, resolveSessionId, buildOpencodeHeaders, injectReasoning } from './proxy.mjs';
+import { toOpenAI, fromOpenAI, translateStream, route, countTokens, keyFor, resolveSessionId, buildOpencodeHeaders, injectReasoning, filteredBeta, extractUsage } from './proxy.mjs';
 
 process.env.OPENCODE_GO_KEY = 'sk-go-test';
 process.env.OPENCODE_ZEN_KEY = 'sk-zen-test';
@@ -152,5 +152,66 @@ assert.strictEqual(
   undefined
 );
 assert.deepStrictEqual(injectReasoning([{ role: 'user', content: 'x' }], 'glm-5.2'), [{ role: 'user', content: 'x' }]);
+
+// toOpenAI: tool-calling assistant with no text must still carry content:null
+const tc = toOpenAI({
+  model: 'kimi-k3',
+  messages: [
+    { role: 'user', content: [{ type: 'text', text: 'go' }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't7', name: 'bash', input: { command: 'ls' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't7', content: 'ok' }] },
+  ],
+});
+assert.strictEqual(tc.messages[1].content, null);
+assert.strictEqual(tc.messages[1].tool_calls.length, 1);
+
+// filteredBeta: allowlist only
+assert.strictEqual(filteredBeta(null), null);
+assert.strictEqual(filteredBeta(''), null);
+assert.strictEqual(filteredBeta('prompt-caching-2024-07-31'), 'prompt-caching-2024-07-31');
+assert.strictEqual(filteredBeta('cache-2025-07-03,context-2025-06-24'), 'cache-2025-07-03, context-2025-06-24');
+assert.strictEqual(filteredBeta('computer-use-2024-05-16,prompt-caching-2024-07-31'), 'prompt-caching-2024-07-31');
+assert.strictEqual(filteredBeta('computer-use-2024-05-16'), null);
+
+// extractUsage: JSON non-stream
+const ju = extractUsage(JSON.stringify({ usage: { input_tokens: 12, output_tokens: 4, cache_read_input_tokens: 7, cache_creation_input_tokens: 5 }, content: [{ type: 'tool_use', id: 't' }] }), 'application/json');
+assert.deepStrictEqual(ju.usage, { input: 12, output: 4, cacheRead: 7, cacheWrite: 5 });
+assert.strictEqual(ju.toolCalls, 1);
+
+// extractUsage: SSE, last message_start/delta usage wins
+const sseBody = [
+  'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":30,"output_tokens":1}}}\n\n',
+  'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t9","name":"bash","input":{}}}\n\n',
+  'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":8}}\n\n',
+].join('');
+const su = extractUsage(sseBody, 'text/event-stream');
+assert.deepStrictEqual(su.usage, { input: 30, output: 8, cacheRead: 0, cacheWrite: 0 });
+assert.strictEqual(su.toolCalls, 1);
+
+// translateStream: final usage chunk feeds message_delta with real input + cache read
+const res2 = fakeRes();
+const sse2 = [
+  'data: {"object":"chat.completion.chunk","id":"s1","choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n',
+  'data: {"object":"chat.completion.chunk","id":"s1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":55,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":40}}}\n\n',
+  'data: [DONE]\n\n',
+];
+const st2 = await translateStream(fakeBody(sse2), res2, 'kimi-k3', { inputEstimate: 500 });
+assert.deepStrictEqual(st2.usage, { input: 55, output: 3, cacheRead: 40, cacheWrite: 0 });
+assert.strictEqual(st2.toolCalls, 0);
+const ev2 = res2.data.split('\n\n').filter((s) => s.includes('"type":"')).map((s) => JSON.parse(s.match(/^data: (.*)$/m)[1]));
+assert.strictEqual(ev2[0].message.usage.input_tokens, 500, 'message_start uses the input estimate placeholder');
+const finalDelta = ev2.find((e) => e.type === 'message_delta');
+assert.strictEqual(finalDelta.usage.input_tokens, 55);
+assert.strictEqual(finalDelta.usage.cache_read_input_tokens, 40);
+
+// translateStream: aborted stream (upstream error mid-read) still returns usage + aborted flag
+const res3 = fakeRes();
+const badBody = { getReader() { return { async read() { throw new Error('boom'); } }; } };
+const st3 = await translateStream(badBody, res3, 'kimi-k3', {});
+assert.strictEqual(st3.aborted, true);
+
+// countTokens counts system + messages + tools
+const ct = countTokens({ system: 'ssss', messages: [{ content: 'aaaa' }], tools: [{ name: 'tttt', description: 'dddd' }] });
+assert.ok(ct.input_tokens >= 4, 'system and tools should contribute to the estimate');
 
 console.log('all proxy tests passed');

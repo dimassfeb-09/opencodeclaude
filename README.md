@@ -89,11 +89,33 @@ ANTHROPIC_DEFAULT_SONNET_MODEL  = <sonnet tier per plan>
 ANTHROPIC_DEFAULT_HAIKU_MODEL   = <haiku tier per plan>
 CLAUDE_CODE_SUBAGENT_MODEL      = <haiku tier per plan>
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = 1
-CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT = 1
+CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT = 1   (only when OPENCODE_DISABLE_WINDOW_ENFORCEMENT=1)
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = 1
 OPENCODE_API_KEY                = <passed to the proxy (empty on the free plan)>
 OPENCODE_PLAN                   = free|go|zen (default: go)
 ```
+
+### Proxy env vars (optional)
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `OPENCODE_CONNECT_TIMEOUT_MS` | `60000` | max time to wait for upstream response headers before aborting |
+| `OPENCODE_CONTEXT_LENGTH` | `200000` | context window reported to Claude Code via `/v1/models` (drives compaction) |
+| `OPENCODE_FORWARD_BETA` | off | forward a *filtered* set of `anthropic-beta` headers on the Claude route (`prompt-caching-*`, `cache-*`, `context-*`) to enable token-efficiency features; off by default because Zen sometimes rejects beta headers |
+| `OPENCODE_DISABLE_WINDOW_ENFORCEMENT` | off | set `1` to restore the old behaviour (window enforcement off, history never auto-compacts) |
+
+### Observability
+
+Every proxied request is logged as one JSON line to **`%APPDATA%\opencodeclaude\proxy.log`** (or `~/.config/opencodeclaude/proxy.log`). Keys / Authorization / message bodies are **never** logged:
+
+```json
+{"t":"2026-08-15T14:00:00.000Z","requestId":"...","model":"deepseek-v4-flash","sessionId":"ses_...","route":"openai","provider":"go","status":200,"ms":3120,"in":12450,"out":812,"cacheRead":0,"cacheWrite":0,"toolCalls":1}
+```
+
+- `in` / `out` / `cacheRead` come straight from the upstream response.
+- `cacheRead` growing between turns of the same session = prompt caching is actually working.
+- `status:"aborted"` / `error:"aborted"` = the client stopped and the upstream fetch was cancelled (no more tokens produced).
+
 
 ---
 
@@ -178,6 +200,9 @@ Key resolution order: **config file -> env var `OPENCODE_API_KEY` -> interactive
 | `opencodeclaude plan go\|zen\|free` | choose which plan's endpoint to use (free needs no key) |
 | `opencodeclaude plan` | show the active plan |
 | `opencodeclaude reset` | delete the stored key |
+| `opencodeclaude log` | show the last 100 proxy log lines |
+| `opencodeclaude log -f` | follow new log lines live (Ctrl+C to stop) |
+| `opencodeclaude update` | update the program files from GitHub (git pull in a repo, re-download in an installed copy) — **your config/keys are never touched** |
 
 ---
 
@@ -285,6 +310,10 @@ Remove-Item -Recurse -Force "$env:APPDATA\opencodeclaude"   # stored key + plan
 | `401 Insufficient balance` on Zen | empty Zen balance | top up billing, or use the Go plan |
 | "Unknown model" error | model name typo | `/model <id>` with the exact id from `/v1/models` |
 | Port 3456 held by a stale proxy | previous process did not exit | the wrapper kills it automatically at launch |
+| no `proxy.log` / log is empty | proxy started with `stdio: ignore` | restart `opencodeclaude` (current wrapper redirects proxy output to the log) |
+| `cacheRead` is always `0` in the log | provider does not report cached tokens, or prompt cache never hits | check the model is reached again with the same `sessionId`; opencode-side caching is server-side (UNVERIFIED from the proxy) |
+| `in` is `0` on streamed requests | streaming final usage chunk missing | expected for some providers; non-stream requests always report real `in` |
+| 400 on a `claude-*` model | Zen rejected the forwarded beta header | don't set `OPENCODE_FORWARD_BETA=1` (default is off) |
 
 ---
 

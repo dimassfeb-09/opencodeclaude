@@ -195,8 +195,15 @@ async function killPid(pid) {
   } catch {}
 }
 
+const PROXY_LOG = path.join(configDir, 'proxy.log');
+const REPO = 'https://raw.githubusercontent.com/dimassfeb-09/opencodeclaude/main';
+const UPDATE_FILES = ['cli.mjs', 'proxy.mjs', 'test.mjs'];
+
 function startProxy(env) {
-  return spawn(process.execPath, [PROXY_FILE], { env, stdio: 'ignore', windowsHide: true });
+  // Capture proxy logs (usage lines, errors) to proxy.log next to the config.
+  fs.mkdirSync(configDir, { recursive: true });
+  const fd = fs.openSync(PROXY_LOG, 'a'); // append; OS closes the fd when the process exits
+  return spawn(process.execPath, [PROXY_FILE], { env, stdio: ['ignore', fd, fd], windowsHide: true });
 }
 
 // --- uninstall -----------------------------------------------------------
@@ -263,6 +270,63 @@ async function main() {
     await uninstall();
     process.exit(0);
   }
+  if (cmd && /^(update|--update|upgrade|--upgrade)$/.test(cmd)) {
+    // Update the program files but NEVER touch the config (key/plan live in configDir).
+    const isGitRepo = fs.existsSync(path.join(ROOT, '.git'));
+    if (isGitRepo) {
+      banner('Updating opencodeclaude (git)');
+      console.log(`${Dim(`Pulling latest into ${ROOT} ...`)}`);
+      const r = spawnSync('git', ['pull', '--ff-only', 'origin', 'main'], { cwd: ROOT, stdio: 'inherit' });
+      if (r.status !== 0) { console.log(`${Yellow('Update failed (non-fast-forward or network).')}`); process.exit(1); }
+      console.log(`${Green('Updated.')}  Config/keys untouched: ${configDir}`);
+      process.exit(0);
+    }
+    // Installed copy: re-download the program files from GitHub main.
+    banner('Updating opencodeclaude (download)');
+    fs.mkdirSync(ROOT, { recursive: true });
+    for (const f of UPDATE_FILES) {
+      const url = `${REPO}/${f}`;
+      console.log(`${Dim(`Downloading ${f} ...`)}`);
+      try {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        fs.writeFileSync(path.join(ROOT, f), await r.text(), 'utf8');
+      } catch (e) {
+        console.log(`${Yellow(`Failed to download ${f}: ${e?.message || e}`)}`);
+        console.log(`${Yellow('Aborted; config untouched, existing files intact.')}`);
+        process.exit(1);
+      }
+    }
+    console.log(`${Green('Updated.')}  Config/keys untouched: ${configDir}`);
+    console.log(`${Dim('Restart the shim / open a new terminal if running an old session.')}`);
+    process.exit(0);
+  }
+  if (cmd && /^(log|--log|tail)$/.test(cmd)) {
+    const follow = args.includes('-f') || args.includes('--follow');
+    if (!fs.existsSync(PROXY_LOG)) {
+      console.log(`No proxy log yet: ${PROXY_LOG}`);
+      console.log("Run 'opencodeclaude' once to generate it (one JSON line per request).");
+      process.exit(0);
+    }
+    const lines = fs.readFileSync(PROXY_LOG, 'utf8').split(/\r?\n/).filter(Boolean);
+    for (const l of lines.slice(-100)) console.log(l);
+    console.log(`${Dim(`\n${lines.length} lines in ${PROXY_LOG}`)}`);
+    if (follow) {
+      let size = fs.statSync(PROXY_LOG).size;
+      fs.watch(PROXY_LOG, () => {
+        try {
+          const data = fs.readFileSync(PROXY_LOG, 'utf8');
+          const chunk = data.slice(size);
+          if (chunk) process.stdout.write(chunk);
+          size = data.length;
+        } catch {}
+      });
+      console.log(`${Dim('Following new requests... Ctrl+C to stop.')}`);
+      process.on('SIGINT', () => process.exit(0));
+    } else {
+      process.exit(0);
+    }
+  }
 
   // First run: pick a plan (interactive only).
   if (!readConfig().OPENCODE_PLAN) {
@@ -305,6 +369,7 @@ async function main() {
   }
 
   console.log(`${Accent(Bold(' ● opencodeclaude'))}  ${Dim('> using')} ${Green(Bold(plan))}${Dim(' plan')}${Dim('  (change: opencodeclaude plan go|zen|free, key: opencodeclaude key)')}`);
+  console.log(`${Dim('   proxy log:')} ${Blue(PROXY_LOG)}`);
 
   const tiers = TIERS[plan];
   const commonEnv = {
@@ -345,7 +410,10 @@ async function main() {
       ANTHROPIC_DEFAULT_SONNET_MODEL: tiers.sonnet,
       ANTHROPIC_DEFAULT_HAIKU_MODEL: tiers.haiku,
       CLAUDE_CODE_SUBAGENT_MODEL: tiers.haiku,
-      CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: '1',
+      // Window enforcement is ON by default now that /v1/models reports a real
+      // context_length (drives compaction so long sessions don't blow up). Opt out
+      // with OPENCODE_DISABLE_WINDOW_ENFORCEMENT=1 to restore the old behaviour.
+      ...(process.env.OPENCODE_DISABLE_WINDOW_ENFORCEMENT === '1' ? { CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: '1' } : {}),
       CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '1',
       // claude still pings its own telemetry/consent endpoints (statsig/anthropic.com)
       // even with a custom base URL; those can be firewall-blocked and cause the

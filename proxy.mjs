@@ -15,6 +15,13 @@ import crypto from 'node:crypto';
 const PORT = Number(process.env.PORT || 3456);
 const KEY = process.env.OPENCODE_API_KEY || '';
 const PLAN = process.env.OPENCODE_PLAN === 'free' ? 'free' : (process.env.OPENCODE_PLAN === 'zen' ? 'zen' : 'go');
+// How long to wait for upstream to send response headers before aborting.
+const CONNECT_TIMEOUT = Number(process.env.OPENCODE_CONNECT_TIMEOUT_MS || 60000);
+// Context window reported to Claude Code via /v1/models (drives compaction).
+const CONTEXT_LENGTH = Number(process.env.OPENCODE_CONTEXT_LENGTH || 200000);
+// Forward a filtered set of anthropic-beta headers on the Claude route (opt-in;
+// defaults to the old behaviour since Zen sometimes rejects beta headers).
+const FORWARD_BETA = process.env.OPENCODE_FORWARD_BETA === '1';
 
 const goKey = () => process.env.OPENCODE_GO_KEY || KEY;
 const zenKey = () => process.env.OPENCODE_ZEN_KEY || KEY;
@@ -88,6 +95,16 @@ export function injectReasoning(messages, model) {
   });
 }
 
+// anthropic-beta headers are forwarded only when opt-in (OPENCODE_FORWARD_BETA=1)
+// and only for prefixes known to enable token-efficiency features. Zen sometimes
+// rejects arbitrary beta headers, so keep the allowlist narrow.
+const BETA_ALLOW_PREFIX = ['prompt-caching', 'cache-', 'context-'];
+export function filteredBeta(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const kept = raw.split(',').map((s) => s.trim()).filter((s) => BETA_ALLOW_PREFIX.some((p) => s.startsWith(p)));
+  return kept.length ? kept.join(', ') : null;
+}
+
 const ZEN_ANTHROPIC = 'https://opencode.ai/zen/v1/messages';
 const ZEN_OPENAI_FREE = 'https://opencode.ai/zen/v1/chat/completions';
 const GO_OPENAI = 'https://opencode.ai/zen/go/v1/chat/completions';
@@ -121,11 +138,14 @@ export async function liveModels() {
       for (const m of data?.data || []) { if (m?.id) s.out.add(m.id); }
     } catch {}
   }));
+  // context_length lets Claude Code gate compaction on the real model window
+  // (instead of relying on the disabled unknown-model enforcement).
+  const win = { context_length: CONTEXT_LENGTH };
   const list = [
-    ...[...go].map((id) => ({ id: `anthropic-go/${id}`, display_name: `${id} (go)`, object: 'model', owned_by: 'go' })),
-    ...[...zen].map((id) => ({ id: `anthropic-zen/${id}`, display_name: `${id} (zen)`, object: 'model', owned_by: 'zen' })),
+    ...[...go].map((id) => ({ id: `anthropic-go/${id}`, display_name: `${id} (go)`, object: 'model', owned_by: 'go', ...win })),
+    ...[...zen].map((id) => ({ id: `anthropic-zen/${id}`, display_name: `${id} (zen)`, object: 'model', owned_by: 'zen', ...win })),
   ];
-  modelsCache = list.length ? list : MODELS.map((m) => ({ id: m, display_name: m, object: 'model', owned_by: 'opencode' }));
+  modelsCache = list.length ? list : MODELS.map((m) => ({ id: m, display_name: m, object: 'model', owned_by: 'opencode', ...win }));
   modelsCacheAt = Date.now();
   return modelsCache;
 }
@@ -169,7 +189,9 @@ export function toOpenAI(body) {
         else if (b.type === 'text' && b.text) text.push(b.text);
       }
       const msg = { role: 'assistant' };
-      if (text.length) msg.content = text.join('\n');
+      // OpenAI requires a content field on tool-calling assistants; some strict
+      // providers reject the field being absent. null is the spec-compliant value.
+      msg.content = text.length ? text.join('\n') : null;
       if (toolCalls.length) msg.tool_calls = toolCalls;
       messages.push(msg);
       continue;
@@ -225,18 +247,30 @@ export function fromOpenAI(data) {
   };
 }
 
-export async function translateStream(body, res, model) {
-  const send = (e) => res.write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
+export async function translateStream(body, res, model, opts = {}) {
+  const send = (e) => {
+    if (res.destroyed || res.writableEnded) return;
+    try { res.write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`); } catch {}
+  };
   let messageStarted = false;
   const open = [];
   let textIdx = null;
   const toolIdx = new Map();
-  let outputTokens = 0;
+  const usage = { input: opts.inputEstimate || 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  let toolCalls = 0;
   let closed = false;
+  let aborted = false;
+
+  const usageEvent = () => ({
+    input_tokens: usage.input,
+    output_tokens: usage.output,
+    cache_read_input_tokens: usage.cacheRead,
+    cache_creation_input_tokens: usage.cacheWrite,
+  });
 
   const ensureStarted = () => {
     if (messageStarted || closed) return;
-    send({ type: 'message_start', message: { id: `msg_${Date.now()}`, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
+    send({ type: 'message_start', message: { id: `msg_${Date.now()}`, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: usage.input, output_tokens: 0 } } });
     messageStarted = true;
   };
 
@@ -244,8 +278,18 @@ export async function translateStream(body, res, model) {
   const rd = body.getReader();
   let buf = '';
   while (!closed) {
-    const { done, value } = await rd.read();
-    if (done) break;
+    let value;
+    try {
+      const r = await rd.read();
+      value = r.value;
+      if (r.done) break;
+    } catch {
+      // Aborted (client disconnect / timeout) or upstream stream error:
+      // stop forwarding, no more tokens are produced upstream after the abort.
+      aborted = true;
+      closed = true;
+      break;
+    }
     buf += dec.decode(value, { stream: true });
     let i;
     while (!closed && (i = buf.indexOf('\n')) >= 0) {
@@ -257,6 +301,13 @@ export async function translateStream(body, res, model) {
       let d;
       try { d = JSON.parse(payload); } catch { continue; }
       if (d.object !== 'chat.completion.chunk') continue;
+      // Real usage arrives on the final chunk(s); cache read may be reported here too.
+      if (d.usage) {
+        if (typeof d.usage.prompt_tokens === 'number') usage.input = d.usage.prompt_tokens;
+        if (typeof d.usage.completion_tokens === 'number') usage.output = d.usage.completion_tokens;
+        const det = d.usage.prompt_tokens_details;
+        if (det && typeof det.cached_tokens === 'number') usage.cacheRead = det.cached_tokens;
+      }
       const choice = d.choices?.[0];
       if (!choice) continue;
       const delta = choice.delta || {};
@@ -273,6 +324,7 @@ export async function translateStream(body, res, model) {
             idx = open.length;
             toolIdx.set(tc.index, idx);
             open.push(idx);
+            toolCalls++;
             send({ type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: tc.id || `toolu_${idx}`, name: tc.function?.name || '', input: {} } });
           }
           if (tc.function?.arguments) {
@@ -280,94 +332,218 @@ export async function translateStream(body, res, model) {
           }
         }
       }
-      if (d.usage?.completion_tokens) outputTokens = d.usage.completion_tokens;
       if (choice.finish_reason) {
         closed = true;
         while (open.length) send({ type: 'content_block_stop', index: open.pop() });
-        send({ type: 'message_delta', delta: { stop_reason: finishMap[choice.finish_reason] || 'end_turn', stop_sequence: null }, usage: { output_tokens: outputTokens } });
+        send({ type: 'message_delta', delta: { stop_reason: finishMap[choice.finish_reason] || 'end_turn', stop_sequence: null }, usage: usageEvent() });
         send({ type: 'message_stop' });
         messageStarted = false;
       }
     }
   }
-  if (messageStarted) {
+  if (messageStarted && !aborted) {
     while (open.length) send({ type: 'content_block_stop', index: open.pop() });
-    send({ type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: outputTokens } });
+    send({ type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: usageEvent() });
     send({ type: 'message_stop' });
   }
   res.end();
+  return { usage, toolCalls, aborted };
 }
 
+// Rough estimate of input tokens (Anthropic-shaped body). Used only for the
+// count_tokens endpoint and as a message_start placeholder when streaming.
 export function countTokens(body) {
+  const approx = (x) => {
+    if (x == null) return 0;
+    const s = typeof x === 'string' ? x : JSON.stringify(x);
+    return s.length / 4;
+  };
   let n = 0;
-  for (const m of body.messages || []) {
-    const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
-    n += c.length / 4;
-  }
+  if (body.system) n += approx(body.system);
+  for (const m of body.messages || []) n += approx(typeof m.content === 'string' ? m.content : m.content || '');
+  for (const t of body.tools || []) n += approx(t);
   return { input_tokens: Math.round(n) };
+}
+
+// Pull the last usage object + tool-use count out of an Anthropic response so we
+// can log real (upstream-reported) token numbers on the Claude route.
+export function extractUsage(text, contentType) {
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  let toolCalls = 0;
+  if (/text\/event-stream/i.test(contentType || '')) {
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === '[DONE]') continue;
+      let d;
+      try { d = JSON.parse(payload); } catch { continue; }
+      if (d.type === 'content_block_start' && d.content_block?.type === 'tool_use') toolCalls++;
+      if (d.type === 'message_start' && d.message?.usage) {
+        usage.input = d.message.usage.input_tokens || 0;
+        usage.output = d.message.usage.output_tokens || 0;
+        usage.cacheRead = d.message.usage.cache_read_input_tokens || 0;
+        usage.cacheWrite = d.message.usage.cache_creation_input_tokens || 0;
+      }
+      if (d.type === 'message_delta' && d.usage) {
+        if (typeof d.usage.output_tokens === 'number') usage.output = d.usage.output_tokens;
+      }
+    }
+  } else {
+    try {
+      const d = JSON.parse(text);
+      const u = d.usage;
+      if (u) {
+        usage.input = u.input_tokens || 0;
+        usage.output = u.output_tokens || 0;
+        usage.cacheRead = u.cache_read_input_tokens || 0;
+        usage.cacheWrite = u.cache_creation_input_tokens || 0;
+      }
+      for (const b of d.content || []) if (b.type === 'tool_use') toolCalls++;
+    } catch {}
+  }
+  return { usage, toolCalls };
 }
 
 async function forward(upstream, res, headers) {
   const ct = upstream.headers.get('content-type') || 'application/json';
-  const body = await upstream.text();
+  let body;
+  try {
+    body = await upstream.text();
+  } catch {
+    if (!res.headersSent && !res.destroyed) res.writeHead(502, { 'content-type': 'application/json' });
+    res.end();
+    return { status: 502, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, toolCalls: 0, aborted: true };
+  }
   if (upstream.status >= 400) {
     res.writeHead(upstream.status, { 'content-type': ct });
     res.end(body);
-    return;
+    return { ...extractUsage(body, ct), status: upstream.status, aborted: false };
   }
   res.writeHead(upstream.status, { 'content-type': ct, ...headers });
   res.write(body, upstream.status !== 200 ? undefined : undefined);
   res.end();
+  return { ...extractUsage(body, ct), status: upstream.status, aborted: false };
 }
 
+// One JSON line per handled request. Never logs the body, Authorization, or keys.
+export function logRequest(rec) {
+  try { console.log(JSON.stringify(rec)); } catch {}
+}
+
+// Abort the upstream fetch when the client disconnects (stop / task switch / close)
+// or when upstream never sends headers within CONNECT_TIMEOUT. Prevents wasted
+// output tokens on cancelled generations and retry-loops from hung upstreams.
+function abortGuard(req, res) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('connect timeout')), CONNECT_TIMEOUT);
+  res.on('close', () => { if (!res.writableEnded) controller.abort(new Error('client disconnected')); });
+  return { controller, clearTimer: () => clearTimeout(timer) };
+}
+
+const routeLabel = (r) => {
+  if (r.kind === 'anthropic') return 'zen-messages';
+  if (r.url.includes('/go/')) return 'go';
+  if (r.url === ZEN_OPENAI_FREE) return 'free';
+  return 'zen';
+};
+
 async function handleMessages(req, res) {
-  let raw = '';
-  for await (const c of req) raw += c;
-  const body = JSON.parse(raw || '{}');
-  const r = route(body.model);
-  body.model = r.model;
+  const rec = { t: new Date().toISOString(), requestId: crypto.randomUUID(), model: req.headers?.['anthropic-model'] || null, sessionId: null, route: null, provider: null, status: null, ms: null, in: 0, out: 0, cacheRead: 0, cacheWrite: 0, toolCalls: 0, error: null };
+  const startedAt = Date.now();
+  const finish = (patch) => {
+    rec.ms = Date.now() - startedAt;
+    Object.assign(rec, patch);
+    logRequest(rec);
+  };
+  const guard = abortGuard(req, res);
+  try {
+    let raw = '';
+    for await (const c of req) raw += c;
+    const body = JSON.parse(raw || '{}');
+    const r = route(body.model);
+    body.model = r.model;
+    rec.model = r.model;
+    const sessionId = resolveSessionId(body, req.headers);
+    rec.sessionId = sessionId;
+    rec.route = r.kind;
+    rec.provider = routeLabel(r);
 
-  // Conversation-stable session id for opencode continuity across turns.
-  const sessionId = resolveSessionId(body, req.headers);
+    if (r.kind === 'anthropic') {
+      const streaming = body.stream !== false;
+      const beta = FORWARD_BETA ? filteredBeta(req.headers['anthropic-beta']) : null;
+      const upstream = await fetch(r.url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
+          ...(beta ? { 'anthropic-beta': beta } : {}),
+          'x-api-key': zenKey(),
+          ...buildOpencodeHeaders(req, sessionId, streaming),
+        },
+        body: JSON.stringify(body),
+        signal: guard.controller.signal,
+      });
+      guard.clearTimer();
+      const f = await forward(upstream, res);
+      finish({ status: f.status, ...f.usage, toolCalls: f.toolCalls, error: f.aborted ? 'aborted' : null });
+      return;
+    }
 
-  if (r.kind === 'anthropic') {
-    const streaming = body.stream !== false;
+    const openaiBody = toOpenAI(body);
+    openaiBody.messages = injectReasoning(openaiBody.messages, r.model);
+    const isFree = r.url === ZEN_OPENAI_FREE;
+    const token = isFree ? 'public' : keyFor(r.url); // free endpoint accepts the dummy 'public' bearer (no account)
+    const streaming = openaiBody.stream !== false;
     const upstream = await fetch(r.url, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
-        'x-api-key': zenKey(),
+        authorization: `Bearer ${token}`,
         ...buildOpencodeHeaders(req, sessionId, streaming),
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(openaiBody),
+      signal: guard.controller.signal,
     });
-    await forward(upstream, res);
-    return;
-  }
+    guard.clearTimer();
 
-  const openaiBody = toOpenAI(body);
-  openaiBody.messages = injectReasoning(openaiBody.messages, r.model);
-  const isFree = r.url === ZEN_OPENAI_FREE;
-  const token = isFree ? 'public' : keyFor(r.url); // free endpoint accepts the dummy 'public' bearer (no account)
-  const streaming = openaiBody.stream !== false;
-  const upstream = await fetch(r.url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${token}`,
-      ...buildOpencodeHeaders(req, sessionId, streaming),
-    },
-    body: JSON.stringify(openaiBody),
-  });
-
-  if (streaming && upstream.status === 200) {
-    res.writeHead(200, { 'content-type': 'text/event-stream' });
-    await translateStream(upstream.body, res, body.model);
-  } else {
-    const data = await upstream.text();
-    res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') || 'application/json' });
-    res.end(upstream.status === 200 ? JSON.stringify(fromOpenAI(JSON.parse(data))) : data);
+    if (streaming && upstream.status === 200) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      const st = await translateStream(upstream.body, res, body.model, { inputEstimate: countTokens(body).input_tokens });
+      finish({ status: 200, ...st.usage, toolCalls: st.toolCalls, error: st.aborted ? 'aborted' : null });
+    } else {
+      let data;
+      try {
+        data = await upstream.text();
+      } catch {
+        finish({ status: 502, error: 'aborted' });
+        if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' });
+        res.end();
+        return;
+      }
+      const status = upstream.status;
+      if (status === 200) {
+        const parsed = JSON.parse(data);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(fromOpenAI(parsed)));
+        const u = parsed?.usage || {};
+        const det = u.prompt_tokens_details;
+        finish({ status: 200, in: u.prompt_tokens || 0, out: u.completion_tokens || 0, cacheRead: det?.cached_tokens || 0, cacheWrite: 0, toolCalls: (parsed?.choices?.[0]?.message?.tool_calls || []).length });
+      } else {
+        res.writeHead(status, { 'content-type': upstream.headers.get('content-type') || 'application/json' });
+        res.end(data);
+        finish({ status, error: `upstream_${status}` });
+      }
+    }
+  } catch (e) {
+    guard.clearTimer();
+    const isAbort = e?.name === 'AbortError';
+    if (!res.headersSent && !res.destroyed) {
+      res.writeHead(502, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: isAbort ? 'request aborted' : String(e?.message || e) } }));
+    } else {
+      try { res.end(); } catch {}
+    }
+    finish({ status: isAbort ? 'aborted' : 502, error: isAbort ? 'aborted' : String(e?.message || e) });
   }
 }
 
