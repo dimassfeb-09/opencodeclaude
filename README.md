@@ -95,6 +95,7 @@ CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT = 1   (only when OPENCODE_D
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = 1
 OPENCODE_API_KEY                = <passed to the proxy (empty on the free plan)>
 OPENCODE_PLAN                   = free|go|zen (default: go)
+OPENCODE_CONNECT_TIMEOUT_MS     = 180000  (proxy upstream header wait; wrapper default, override with your own env)
 ```
 
 ### Proxy env vars (optional)
@@ -103,6 +104,7 @@ OPENCODE_PLAN                   = free|go|zen (default: go)
 |---|---|---|
 | `OPENCODE_CONNECT_TIMEOUT_MS` | `60000` | max time to wait for upstream response headers before aborting |
 | `OPENCODE_CONTEXT_LENGTH` | `200000` | context window reported to Claude Code via `/v1/models` (drives compaction) |
+| `OPENCODE_RETRIES` | `2` | max auto-retries on transient upstream failures (network error, HTTP 429, HTTP 5xx) with exponential backoff (`0` disables) |
 | `OPENCODE_FORWARD_BETA` | off | forward a *filtered* set of `anthropic-beta` headers on the Claude route (`prompt-caching-*`, `cache-*`, `context-*`) to enable token-efficiency features; off by default because Zen sometimes rejects beta headers |
 | `OPENCODE_DISABLE_WINDOW_ENFORCEMENT` | off | set `1` to restore the old behaviour (window enforcement off, history never auto-compacts) |
 | `OPENCODE_CUSTOM_ENDPOINT` | - | custom plan: OpenAI-compatible base URL (proxy appends `/chat/completions` and `/models`) |

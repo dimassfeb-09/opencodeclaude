@@ -418,6 +418,10 @@ async function main() {
     OPENCODE_CUSTOM_ENDPOINT: customCfg.OPENCODE_CUSTOM_ENDPOINT || '',
     OPENCODE_CUSTOM_KEY: customCfg.OPENCODE_CUSTOM_KEY || '',
     OPENCODE_CUSTOM_PROVIDER: customCfg.OPENCODE_CUSTOM_PROVIDER || 'custom',
+    // Slow upstreams (free tier) can stall before the first chunk; give the proxy
+    // 3 minutes to wait for response headers instead of the 60s default. Only set
+    // when the user hasn't picked their own value.
+    ...(process.env.OPENCODE_CONNECT_TIMEOUT_MS ? {} : { OPENCODE_CONNECT_TIMEOUT_MS: '180000' }),
   };
 
   let proxyProc = null;

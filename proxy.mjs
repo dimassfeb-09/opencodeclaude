@@ -19,6 +19,9 @@ const PLAN = process.env.OPENCODE_PLAN === 'free' ? 'free' : (process.env.OPENCO
 const CONNECT_TIMEOUT = Number(process.env.OPENCODE_CONNECT_TIMEOUT_MS || 60000);
 // Context window reported to Claude Code via /v1/models (drives compaction).
 const CONTEXT_LENGTH = Number(process.env.OPENCODE_CONTEXT_LENGTH || 200000);
+// Max retries for transient upstream failures (network error, 429, 5xx), with
+// exponential backoff. 0 disables retrying.
+const MAX_RETRIES = Number(process.env.OPENCODE_RETRIES || 2);
 // Forward a filtered set of anthropic-beta headers on the Claude route (opt-in;
 // defaults to the old behaviour since Zen sometimes rejects beta headers).
 const FORWARD_BETA = process.env.OPENCODE_FORWARD_BETA === '1';
@@ -576,6 +579,49 @@ function abortGuard(req, res) {
   return { controller, clearTimer: () => clearTimeout(timer) };
 }
 
+const backoffMs = (n) => 500 * 2 ** (n - 1);
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Fetch an upstream URL, retrying transient failures (network error, HTTP 429,
+// HTTP 5xx) with exponential backoff up to OPENCODE_RETRIES attempts. The body is
+// a string, so it can be re-sent verbatim each attempt (fetch consumes it). An
+// aborted request is never retried - it surfaces the client disconnect as-is.
+async function fetchWithRetry(url, { method = 'POST', headers = {}, body, signal, maxRetries = MAX_RETRIES }) {
+  for (let attempt = 0; ; attempt++) {
+    let res;
+    try {
+      res = await fetch(url, { method, headers, body, signal });
+    } catch (err) {
+      if (signal?.aborted || attempt >= maxRetries) throw err;
+      await sleepMs(backoffMs(attempt + 1));
+      continue;
+    }
+    if (res.status === 429 || res.status >= 500) {
+      if (!signal?.aborted) await res.body?.cancel().catch(() => {});
+      if (signal?.aborted || attempt >= maxRetries) return res;
+      await sleepMs(backoffMs(attempt + 1));
+      continue;
+    }
+    return res;
+  }
+}
+
+// Drop the oldest non-system messages when the conversation has outgrown the
+// reported context window (the client did not auto-compact in time). Keeps the
+// system prompt and the newest messages - the latest turn is never dropped.
+export function compactBody(body, budget = CONTEXT_LENGTH - 8192) {
+  if (countTokens(body).input_tokens <= budget) return { body, dropped: 0 };
+  const msgs = (body.messages || []).slice();
+  let dropped = 0;
+  while (msgs.length > 1) {
+    const first = msgs.shift();
+    if (first.role === 'system') { msgs.unshift(first); break; }
+    dropped++;
+    if (countTokens({ ...body, messages: msgs }).input_tokens <= budget) break;
+  }
+  return { body: { ...body, messages: msgs }, dropped };
+}
+
 // Provider label for the log. Distinguish free by the model suffix, not the URL
 // (ZEN_OPENAI and ZEN_OPENAI_FREE share the same path).
 const routeLabel = (r) => {
@@ -598,7 +644,12 @@ async function handleMessages(req, res) {
   try {
     let raw = '';
     for await (const c of req) raw += c;
-    const body = JSON.parse(raw || '{}');
+    let body = JSON.parse(raw || '{}');
+    // Compact the conversation if it outgrew the context window (client did not
+    // auto-compact): drop the oldest messages, keep system + newest.
+    const compacted = compactBody(body);
+    body = compacted.body;
+    if (compacted.dropped) rec.compact = compacted.dropped;
     const r = route(body.model);
     body.model = r.model;
     rec.model = r.model;
@@ -619,7 +670,7 @@ async function handleMessages(req, res) {
     if (r.kind === 'anthropic') {
       const streaming = body.stream !== false;
       const beta = FORWARD_BETA ? filteredBeta(req.headers['anthropic-beta']) : null;
-      const upstream = await fetch(r.url, {
+      const upstream = await fetchWithRetry(r.url, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
@@ -647,7 +698,7 @@ async function handleMessages(req, res) {
     const headers = r.kind === 'custom'
       ? buildCustomHeaders(req, sessionId, r.model, streaming)
       : { 'content-type': 'application/json', authorization: `Bearer ${token}`, ...buildOpencodeHeaders(req, sessionId, r.model, streaming) };
-    const upstream = await fetch(r.url, {
+    const upstream = await fetchWithRetry(r.url, {
       method: 'POST',
       headers,
       body: JSON.stringify(openaiBody),

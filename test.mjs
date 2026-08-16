@@ -1,6 +1,6 @@
 // opencodeclaude proxy self-check: node test.mjs
 import assert from 'node:assert';
-import { toOpenAI, fromOpenAI, translateStream, route, countTokens, keyFor, resolveSessionId, buildOpencodeHeaders, injectReasoning, filteredBeta, extractUsage, usagePatch, errorToAnthropic, requestKey, customCfg, customChatUrl, customModelsUrl, buildCustomHeaders } from './proxy.mjs';
+import { toOpenAI, fromOpenAI, translateStream, route, countTokens, keyFor, resolveSessionId, buildOpencodeHeaders, injectReasoning, filteredBeta, extractUsage, usagePatch, errorToAnthropic, requestKey, customCfg, customChatUrl, customModelsUrl, buildCustomHeaders, compactBody } from './proxy.mjs';
 
 process.env.OPENCODE_GO_KEY = 'sk-go-test';
 process.env.OPENCODE_ZEN_KEY = 'sk-zen-test';
@@ -298,5 +298,14 @@ assert.ok(/400/.test(fallback.error.message));
 // toOpenAI: stream defaults to true
 assert.strictEqual(toOpenAI({ model: 'kimi-k3', messages: [{ role: 'user', content: 'x' }] }).stream, true);
 assert.strictEqual(toOpenAI({ model: 'kimi-k3', stream: false, messages: [{ role: 'user', content: 'x' }] }).stream, false);
+
+// compactBody: under budget → untouched; over budget → oldest dropped, system + newest kept
+const long = 'x'.repeat(400); // countTokens: 400 chars / 4 ≈ 100 tokens per message
+assert.strictEqual(compactBody({ messages: [{ role: 'user', content: 'hi' }] }, 1000).dropped, 0, 'small body untouched');
+const big = compactBody({ system: 'sys', messages: [{ role: 'user', content: long }, { role: 'user', content: long }, { role: 'user', content: long }, { role: 'user', content: 'newest' }] }, 100);
+assert.ok(big.dropped > 0, `expected drops, got ${big.dropped}`);
+assert.strictEqual(big.body.system, 'sys', 'system prompt kept');
+assert.strictEqual(big.body.messages[big.body.messages.length - 1].content, 'newest', 'newest message kept');
+assert.ok(big.body.messages.length >= 1, 'at least one message survives');
 
 console.log('all proxy tests passed');
