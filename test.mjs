@@ -56,19 +56,21 @@ assert.strictEqual(customChatUrl(), '', 'no endpoint → empty chat URL');
 assert.strictEqual(customModelsUrl(), '', 'no endpoint → empty models URL');
 process.env.OPENCODE_CUSTOM_ENDPOINT = 'https://api.x/v1';
 
-// buildCustomHeaders: key set, streaming Accept, no opencode masquerade
-const ch = buildCustomHeaders({ headers: { 'x-opencode-client': 'desktop' } }, 'mistral-7b', true);
+// buildCustomHeaders: key set, streaming Accept, session forwarded, no other masquerade
+const ch = buildCustomHeaders({ headers: { 'x-opencode-client': 'desktop' } }, 'ses_abc', 'mistral-7b', true);
 assert.strictEqual(ch.authorization, 'Bearer sk-custom-test');
 assert.strictEqual(ch.Accept, 'text/event-stream');
 assert.strictEqual(ch['User-Agent'], 'opencodeclaude');
 assert.strictEqual(ch['content-type'], 'application/json');
+assert.strictEqual(ch['x-opencode-session'], 'ses_abc', 'custom headers forward the resolved session');
 assert.ok(!('x-opencode-client' in ch), 'custom headers must not carry opencode identity');
-assert.ok(!('x-opencode-session' in ch), 'custom headers must not carry opencode session');
+// no session → no session header
+assert.ok(!('x-opencode-session' in buildCustomHeaders({}, null, 'mistral-7b', true)), 'no session → no session header');
 // non-streaming → Accept */*
-assert.strictEqual(buildCustomHeaders({}, 'mistral-7b', false).Accept, '*/*');
+assert.strictEqual(buildCustomHeaders({}, null, 'mistral-7b', false).Accept, '*/*');
 // no key configured → no authorization header at all
 delete process.env.OPENCODE_CUSTOM_KEY;
-assert.ok(!('authorization' in buildCustomHeaders({}, 'mistral-7b', true)));
+assert.ok(!('authorization' in buildCustomHeaders({}, null, 'mistral-7b', true)));
 process.env.OPENCODE_CUSTOM_KEY = 'sk-custom-test';
 // default provider tag
 delete process.env.OPENCODE_CUSTOM_PROVIDER;

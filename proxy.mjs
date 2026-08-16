@@ -106,14 +106,17 @@ export function buildOpencodeHeaders(req, sessionId, model, streaming) {
 
 // Plain OpenAI-compatible headers for the custom route. Unlike buildOpencodeHeaders,
 // no x-opencode-* masquerade headers are sent (the custom endpoint is not opencode).
-// The Authorization header is omitted when no key is configured (local providers).
-export function buildCustomHeaders(req, model, streaming) {
+// The conversation-stable session id is forwarded (x-opencode-session) so a custom
+// gateway can pin the conversation to one identity. The Authorization header is
+// omitted when no key is configured (local providers).
+export function buildCustomHeaders(req, sessionId, model, streaming) {
   const key = customCfg().key;
   const h = {
     'content-type': 'application/json',
     Accept: streaming ? 'text/event-stream' : '*/*',
     'User-Agent': 'opencodeclaude',
   };
+  if (sessionId) h['x-opencode-session'] = sessionId;
   if (key) h.authorization = `Bearer ${key}`;
   return h;
 }
@@ -642,7 +645,7 @@ async function handleMessages(req, res) {
     // Custom providers get plain OpenAI headers (no opencode masquerade); go/zen
     // endpoints send the opencode identity headers and the plan's bearer token.
     const headers = r.kind === 'custom'
-      ? buildCustomHeaders(req, r.model, streaming)
+      ? buildCustomHeaders(req, sessionId, r.model, streaming)
       : { 'content-type': 'application/json', authorization: `Bearer ${token}`, ...buildOpencodeHeaders(req, sessionId, r.model, streaming) };
     const upstream = await fetch(r.url, {
       method: 'POST',
