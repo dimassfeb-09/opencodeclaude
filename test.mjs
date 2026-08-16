@@ -1,9 +1,12 @@
 // opencodeclaude proxy self-check: node test.mjs
 import assert from 'node:assert';
-import { toOpenAI, fromOpenAI, translateStream, route, countTokens, keyFor, resolveSessionId, buildOpencodeHeaders, injectReasoning, filteredBeta, extractUsage, usagePatch, errorToAnthropic, requestKey } from './proxy.mjs';
+import { toOpenAI, fromOpenAI, translateStream, route, countTokens, keyFor, resolveSessionId, buildOpencodeHeaders, injectReasoning, filteredBeta, extractUsage, usagePatch, errorToAnthropic, requestKey, customCfg, customChatUrl, customModelsUrl, buildCustomHeaders } from './proxy.mjs';
 
 process.env.OPENCODE_GO_KEY = 'sk-go-test';
 process.env.OPENCODE_ZEN_KEY = 'sk-zen-test';
+process.env.OPENCODE_CUSTOM_ENDPOINT = 'https://api.x/v1';
+process.env.OPENCODE_CUSTOM_PROVIDER = 'mistral';
+process.env.OPENCODE_CUSTOM_KEY = 'sk-custom-test';
 
 assert.strictEqual(keyFor('https://opencode.ai/zen/go/v1/chat/completions'), 'sk-go-test');
 assert.strictEqual(keyFor('https://opencode.ai/zen/go/v1/models'), 'sk-go-test');
@@ -31,6 +34,46 @@ assert.strictEqual(route('anthropic-go/qwen3.6-plus').url, 'https://opencode.ai/
 assert.strictEqual(route('anthropic-zen/claude-sonnet-4-6').kind, 'anthropic');
 assert.strictEqual(route('anthropic-zen/claude-sonnet-4-6').model, 'claude-sonnet-4-6');
 assert.strictEqual(route('opencode-go/kimi-k3').url, 'https://opencode.ai/zen/go/v1/chat/completions');
+
+// route: custom provider (custom/<provider>/<model> and the bare custom/<model> alias)
+const customRoute = route('custom/mistral/mistral-7b');
+assert.strictEqual(customRoute.kind, 'custom');
+assert.strictEqual(customRoute.url, 'https://api.x/v1/chat/completions');
+assert.strictEqual(customRoute.model, 'mistral-7b');
+// bare alias: no <provider>/ prefix → whole rest is the model
+assert.strictEqual(route('custom/mistral-7b').model, 'mistral-7b');
+// provider mismatch → whole rest forwarded
+assert.strictEqual(route('custom/nous/nous-hermes-2').model, 'nous/nous-hermes-2');
+// model ids that look like go/zen stay on their own routes
+assert.strictEqual(route('custom/claude-sonnet-4-6').kind, 'custom');
+
+// customChatUrl / customModelsUrl: trailing slashes stripped, suffix appended
+process.env.OPENCODE_CUSTOM_ENDPOINT = 'https://api.x/v1/';
+assert.strictEqual(customChatUrl(), 'https://api.x/v1/chat/completions');
+assert.strictEqual(customModelsUrl(), 'https://api.x/v1/models');
+delete process.env.OPENCODE_CUSTOM_ENDPOINT;
+assert.strictEqual(customChatUrl(), '', 'no endpoint → empty chat URL');
+assert.strictEqual(customModelsUrl(), '', 'no endpoint → empty models URL');
+process.env.OPENCODE_CUSTOM_ENDPOINT = 'https://api.x/v1';
+
+// buildCustomHeaders: key set, streaming Accept, no opencode masquerade
+const ch = buildCustomHeaders({ headers: { 'x-opencode-client': 'desktop' } }, 'mistral-7b', true);
+assert.strictEqual(ch.authorization, 'Bearer sk-custom-test');
+assert.strictEqual(ch.Accept, 'text/event-stream');
+assert.strictEqual(ch['User-Agent'], 'opencodeclaude');
+assert.strictEqual(ch['content-type'], 'application/json');
+assert.ok(!('x-opencode-client' in ch), 'custom headers must not carry opencode identity');
+assert.ok(!('x-opencode-session' in ch), 'custom headers must not carry opencode session');
+// non-streaming → Accept */*
+assert.strictEqual(buildCustomHeaders({}, 'mistral-7b', false).Accept, '*/*');
+// no key configured → no authorization header at all
+delete process.env.OPENCODE_CUSTOM_KEY;
+assert.ok(!('authorization' in buildCustomHeaders({}, 'mistral-7b', true)));
+process.env.OPENCODE_CUSTOM_KEY = 'sk-custom-test';
+// default provider tag
+delete process.env.OPENCODE_CUSTOM_PROVIDER;
+assert.strictEqual(route('custom/my-model').model, 'my-model');
+process.env.OPENCODE_CUSTOM_PROVIDER = 'mistral';
 
 // toOpenAI: system + user text + assistant tool_use + user tool_result
 const o = toOpenAI({

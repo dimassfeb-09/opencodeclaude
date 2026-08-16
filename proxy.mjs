@@ -27,6 +27,20 @@ const goKey = () => process.env.OPENCODE_GO_KEY || KEY;
 const zenKey = () => process.env.OPENCODE_ZEN_KEY || KEY;
 export const keyFor = (url) => (url.includes('/zen/go/') ? goKey() : zenKey());
 
+// --- custom provider config (read at call time so tests can set env after import) ---
+// OPENCODE_CUSTOM_ENDPOINT is an OpenAI-compatible base URL (e.g. https://api.x/v1);
+// the proxy appends /chat/completions and /models. The key is optional (local
+// providers like Ollama need no auth). OPENCODE_CUSTOM_PROVIDER tags the models so
+// they show up as custom/<provider>/<model> and are visibly distinct from go/zen.
+export const customCfg = () => {
+  const endpoint = (process.env.OPENCODE_CUSTOM_ENDPOINT || '').trim().replace(/\/+$/, '');
+  const provider = (process.env.OPENCODE_CUSTOM_PROVIDER || '').trim() || 'custom';
+  const key = process.env.OPENCODE_CUSTOM_KEY || '';
+  return { endpoint, provider, key };
+};
+export function customChatUrl() { return customCfg().endpoint ? `${customCfg().endpoint}/chat/completions` : ''; }
+export function customModelsUrl() { return customCfg().endpoint ? `${customCfg().endpoint}/models` : ''; }
+
 // --- opencode upstream identity (learned from 9router's opencode executor) ---
 const OPENCODE_UA = 'opencode';
 // Claude Code embeds its per-session id in metadata.user_id as _session_<uuid>
@@ -90,6 +104,20 @@ export function buildOpencodeHeaders(req, sessionId, model, streaming) {
   };
 }
 
+// Plain OpenAI-compatible headers for the custom route. Unlike buildOpencodeHeaders,
+// no x-opencode-* masquerade headers are sent (the custom endpoint is not opencode).
+// The Authorization header is omitted when no key is configured (local providers).
+export function buildCustomHeaders(req, model, streaming) {
+  const key = customCfg().key;
+  const h = {
+    'content-type': 'application/json',
+    Accept: streaming ? 'text/event-stream' : '*/*',
+    'User-Agent': 'opencodeclaude',
+  };
+  if (key) h.authorization = `Bearer ${key}`;
+  return h;
+}
+
 // Some reasoning models (Kimi, DeepSeek, ...) require reasoning_content echoed back on
 // assistant messages; Claude Code never sends it, so inject a placeholder to satisfy
 // upstream validation (mirrors 9router's reasoningContentInjector).
@@ -136,12 +164,15 @@ export async function liveModels() {
   if (modelsCache && Date.now() - modelsCacheAt < MODEL_TTL) return modelsCache;
   const go = new Set();
   const zen = new Set();
+  const custom = new Set();
+  const customPath = customModelsUrl();
   await Promise.all([
     { url: 'https://opencode.ai/zen/go/v1/models', out: go, key: goKey },
     { url: 'https://opencode.ai/zen/v1/models', out: zen, key: zenKey },
+    ...(customPath ? [{ url: customPath, out: custom, key: () => customCfg().key }] : []),
   ].map(async (s) => {
     try {
-      const r = await fetch(s.url, { headers: { authorization: `Bearer ${s.key()}` } });
+      const r = await fetch(s.url, { headers: s.key() ? { authorization: `Bearer ${s.key()}` } : {} });
       if (!r.ok) return;
       const data = await r.json();
       for (const m of data?.data || []) { if (m?.id) s.out.add(m.id); }
@@ -153,6 +184,7 @@ export async function liveModels() {
   const list = [
     ...[...go].map((id) => ({ id: `anthropic-go/${id}`, display_name: `${id} (go)`, object: 'model', owned_by: 'go', ...win })),
     ...[...zen].map((id) => ({ id: `anthropic-zen/${id}`, display_name: `${id} (zen)`, object: 'model', owned_by: 'zen', ...win })),
+    ...[...custom].map((id) => ({ id: `custom/${customCfg().provider}/${id}`, display_name: `${id} (${customCfg().provider})`, object: 'model', owned_by: 'custom', ...win })),
   ];
   modelsCache = list.length ? list : MODELS.map((m) => ({ id: m, display_name: m, object: 'model', owned_by: 'opencode', ...win }));
   modelsCacheAt = Date.now();
@@ -169,6 +201,14 @@ export function route(model) {
 
   if (/^claude-/.test(m)) return { kind: 'anthropic', url: ZEN_ANTHROPIC, model: m };
   if (/^qwen3/.test(m) && forced !== 'go') return { kind: 'anthropic', url: ZEN_ANTHROPIC, model: m };
+  // Custom provider: custom/<provider>/<model> (the bare custom/<model> alias is
+  // also accepted). Route is always OpenAI-format, no opencode masquerade.
+  if (m.startsWith('custom/')) {
+    const { provider } = customCfg();
+    const rest = m.slice('custom/'.length);
+    const model = rest.startsWith(provider + '/') ? rest.slice(provider.length + 1) : rest;
+    return { kind: 'custom', url: customChatUrl(), model };
+  }
   if (/-free$/.test(m)) return { kind: 'openai', url: ZEN_OPENAI_FREE, model: m };
   const url = forced === 'go' ? GO_OPENAI : forced === 'zen' ? ZEN_OPENAI : OPENAI;
   return { kind: 'openai', url, model: m };
@@ -536,6 +576,7 @@ function abortGuard(req, res) {
 // Provider label for the log. Distinguish free by the model suffix, not the URL
 // (ZEN_OPENAI and ZEN_OPENAI_FREE share the same path).
 const routeLabel = (r) => {
+  if (r.kind === 'custom') return 'custom';
   if (r.kind === 'anthropic') return 'zen-messages';
   if (/-free$/.test(r.model)) return 'free';
   if (r.url.includes('/go/')) return 'go';
@@ -563,6 +604,15 @@ async function handleMessages(req, res) {
     rec.route = r.kind;
     rec.provider = routeLabel(r);
 
+    // Defensive: the custom endpoint should always be set (cli.mjs validates at
+    // launch), but a stale config or rolled-back env shouldn't 500 the proxy.
+    if (r.kind === 'custom' && !r.url) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'custom provider endpoint not configured' } }));
+      finish({ status: 400, error: 'custom_endpoint_missing' });
+      return;
+    }
+
     if (r.kind === 'anthropic') {
       const streaming = body.stream !== false;
       const beta = FORWARD_BETA ? filteredBeta(req.headers['anthropic-beta']) : null;
@@ -589,13 +639,14 @@ async function handleMessages(req, res) {
     const isFree = r.url === ZEN_OPENAI_FREE;
     const token = isFree ? 'public' : keyFor(r.url); // free endpoint accepts the dummy 'public' bearer (no account)
     const streaming = openaiBody.stream !== false;
+    // Custom providers get plain OpenAI headers (no opencode masquerade); go/zen
+    // endpoints send the opencode identity headers and the plan's bearer token.
+    const headers = r.kind === 'custom'
+      ? buildCustomHeaders(req, r.model, streaming)
+      : { 'content-type': 'application/json', authorization: `Bearer ${token}`, ...buildOpencodeHeaders(req, sessionId, r.model, streaming) };
     const upstream = await fetch(r.url, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${token}`,
-        ...buildOpencodeHeaders(req, sessionId, r.model, streaming),
-      },
+      headers,
       body: JSON.stringify(openaiBody),
       signal: guard.controller.signal,
     });

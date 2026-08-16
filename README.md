@@ -5,6 +5,7 @@ Run [Claude Code](https://docs.claude.com/en/docs/claude-code) against **all Ope
 - **OpenCode Free** - no account, no key, free models only (e.g. `deepseek-v4-flash-free`)
 - **OpenCode Zen** - pay-as-you-go (Claude, Qwen, GPT, DeepSeek, Kimi, GLM, ...)
 - **OpenCode Go** - flat fee (Kimi, DeepSeek, GLM, MiniMax, Qwen, ...)
+- **Custom / other provider** - bring your own OpenAI-compatible endpoint & key (OpenRouter, Ollama, any OpenAI-format API)
 
 One command, paste your key once (or pick `free`), everything else just works. A local wrapper starts a proxy, sets the env vars, and launches `claude`.
 
@@ -58,7 +59,7 @@ Two pieces:
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/messages` | incoming from Claude Code, routed + translated |
-| `GET /v1/models` | live model catalog (go + zen, prefixed) |
+| `GET /v1/models` | live model catalog (go + zen + custom, prefixed) |
 | `GET /health` | liveness check (used by the wrapper to kill stale proxies) |
 
 Default port: `3456`.
@@ -71,6 +72,7 @@ Default port: `3456`.
 |---|---|---|
 | `claude-*` | Zen `/zen/v1/messages` | native Anthropic, `x-api-key`, pass-through |
 | `qwen3*` | Zen `/zen/v1/messages` | native Anthropic (unless forced to `go`) |
+| `custom/<provider>/<model>` | `<OPENCODE_CUSTOM_ENDPOINT>/chat/completions` | custom provider, OpenAI format, plain `Bearer` auth (no `x-opencode-*` masquerade) |
 | `*-free` | Zen `/zen/v1/chat/completions` | free tier, OpenAI format, `Bearer public` (no key) |
 | others | Go `/zen/go/v1/chat/completions`, Zen `/zen/v1/chat/completions`, or free `/zen/v1/chat/completions` | depends on plan / prefix |
 
@@ -103,6 +105,9 @@ OPENCODE_PLAN                   = free|go|zen (default: go)
 | `OPENCODE_CONTEXT_LENGTH` | `200000` | context window reported to Claude Code via `/v1/models` (drives compaction) |
 | `OPENCODE_FORWARD_BETA` | off | forward a *filtered* set of `anthropic-beta` headers on the Claude route (`prompt-caching-*`, `cache-*`, `context-*`) to enable token-efficiency features; off by default because Zen sometimes rejects beta headers |
 | `OPENCODE_DISABLE_WINDOW_ENFORCEMENT` | off | set `1` to restore the old behaviour (window enforcement off, history never auto-compacts) |
+| `OPENCODE_CUSTOM_ENDPOINT` | - | custom plan: OpenAI-compatible base URL (proxy appends `/chat/completions` and `/models`) |
+| `OPENCODE_CUSTOM_KEY` | - | custom plan: API key (omitted — no `Authorization` header — when empty, for local/no-key providers) |
+| `OPENCODE_CUSTOM_PROVIDER` | `custom` | custom plan: provider tag, models appear as `custom/<provider>/<model>` |
 
 ### Observability
 
@@ -173,7 +178,7 @@ opencodeclaude() { node "$HOME/opencodeclaude/cli.mjs" "$@"; }
 
 The first time you run `opencodeclaude`, it asks two things:
 
-1. **Choose the plan** - `1` = go, `2` = zen, `3` = free (default: go)
+1. **Choose the plan** - `1` = go, `2` = zen, `3` = free, `4` = custom (default: go)
 2. **Enter your OpenCode API key** - get one at https://opencode.ai/auth *(only for go/zen; the free plan needs no key)*
 
 Everything is saved to `%APPDATA%\opencodeclaude\config` (or `~/.config/opencodeclaude/config` on Linux/macOS) with restrictive permissions. Every run after that just works.
@@ -189,6 +194,24 @@ opencodeclaude
 
 The free plan runs on the opencode **`/zen/v1`** endpoint with the dummy `public` bearer token, using whichever free models opencode currently offers (auto-fetched by the proxy from `/zen/v1/models`). Model availability fluctuates over time and is subject to rate limits.
 
+### Going custom — bring your own provider
+
+Any OpenAI-compatible endpoint works as a fourth plan (OpenRouter, a local Ollama, a vLLM server, ...). Configure it once, interactively:
+
+```powershell
+opencodeclaude plan custom
+```
+
+or inline (endpoint, key, provider tag):
+
+```powershell
+opencodeclaude custom https://api.openrouter.ai/v1 sk-or-... mistral
+```
+
+The proxy appends `/chat/completions` and `/models` to the base URL, fetches the model list live, and tags each model `custom/<provider>/<model>` so they're visibly distinct from go/zen. The key is optional — providers like Ollama are sent **no `Authorization` header** at all. Pick a fetched model with `/model custom/mistral/mistral-7b` or `--model custom/mistral/mistral-7b` (the picker only auto-lists `claude`/`anthropic`-prefixed ids, same as go/zen).
+
+> Endpoint only: the proxy always appends the OpenAI paths, so give it the base, e.g. `https://api.openrouter.ai/v1` — not `/v1/chat/completions`.
+
 ### Managing the key and plan
 
 Key resolution order: **config file -> env var `OPENCODE_API_KEY` -> interactive prompt**.
@@ -197,7 +220,7 @@ Key resolution order: **config file -> env var `OPENCODE_API_KEY` -> interactive
 |---|---|
 | `opencodeclaude config` | change key (interactive) |
 | `opencodeclaude config <KEY>` | change key inline |
-| `opencodeclaude plan go\|zen\|free` | choose which plan's endpoint to use (free needs no key) |
+| `opencodeclaude plan go\|zen\|free\|custom` | choose which plan's endpoint to use (free needs no key; custom prompts for endpoint/key/provider) |
 | `opencodeclaude plan` | show the active plan |
 | `opencodeclaude reset` | delete the stored key |
 | `opencodeclaude log` | show the last 100 proxy log lines |
@@ -215,6 +238,7 @@ opencodeclaude --model kimi-k3          # override the default model
 opencodeclaude --model anthropic-zen/claude-opus-4-8   # endpoint-specific model
 opencodeclaude plan zen                 # switch plan
 opencodeclaude plan free                # no key needed - free models only
+opencodeclaude custom <endpoint> [key] [provider]   # custom OpenAI-compatible provider
 ```
 
 CLI arguments are passed straight through to `claude`, so all `claude` flags still apply.
@@ -236,7 +260,10 @@ Inside Claude Code, press `/model`. The picker shows:
 anthropic-go/kimi-k3              -> kimi-k3 (go)   - Go, flat fee
 anthropic-zen/kimi-k3             -> kimi-k3 (zen)  - Zen, pay-as-you-go
 anthropic-zen/claude-sonnet-5     -> claude-sonnet-5 (zen)
+custom/mistral/mistral-7b         -> mistral-7b (mistral) - custom provider
 ```
+
+Custom models are fetched and tagged but **not** auto-listed by the picker (Claude Code only lists ids starting `claude`/`anthropic` — same rule as go/zen). Reach them with `/model custom/<provider>/<model>` or `--model custom/<provider>/<model>`.
 
 ### 2. The `--model` flag (one session)
 
@@ -250,11 +277,11 @@ Any model id works, even ones not shown in the picker.
 
 The Default / Opus / Sonnet / Haiku tiers resolve to:
 
-| Tier | Go plan | Zen plan | Free plan |
-|---|---|---|---|
-| Opus (thinking) | `deepseek-v4-flash` | `claude-opus-4-8` | `deepseek-v4-flash-free` |
-| Sonnet (default) | `deepseek-v4-flash` | `claude-sonnet-4-6` | `deepseek-v4-flash-free` |
-| Haiku (subagent) | `deepseek-v4-flash` | `claude-haiku-4-5` | `deepseek-v4-flash-free` |
+| Tier | Go plan | Zen plan | Free plan | Custom plan |
+|---|---|---|---|---|
+| Opus (thinking) | `deepseek-v4-flash` | `claude-opus-4-8` | `deepseek-v4-flash-free` | first model from `/models` |
+| Sonnet (default) | `deepseek-v4-flash` | `claude-sonnet-4-6` | `deepseek-v4-flash-free` | first model from `/models` |
+| Haiku (subagent) | `deepseek-v4-flash` | `claude-haiku-4-5` | `deepseek-v4-flash-free` | first model from `/models` |
 
 ### Why does the picker show only a handful? - and why the "Gateway" label
 
@@ -314,6 +341,8 @@ Remove-Item -Recurse -Force "$env:APPDATA\opencodeclaude"   # stored key + plan
 | `cacheRead` is always `0` in the log | provider does not report cached tokens, or prompt cache never hits | check the model is reached again with the same `sessionId`; opencode-side caching is server-side (UNVERIFIED from the proxy) |
 | `in` is `0` on streamed requests | streaming final usage chunk missing | expected for some providers; non-stream requests always report real `in` |
 | 400 on a `claude-*` model | Zen rejected the forwarded beta header | don't set `OPENCODE_FORWARD_BETA=1` (default is off) |
+| custom plan exits with "No models fetched" | endpoint/URL or key wrong, or `/models` unreachable | re-run `opencodeclaude custom` with the exact base URL (proxy appends `/chat/completions` and `/models`) |
+| custom model not in `/model` picker | Claude Code only auto-lists `claude`/`anthropic` ids | use `/model custom/<provider>/<model>` or `--model custom/<provider>/<model>` |
 
 ---
 

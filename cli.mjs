@@ -36,6 +36,8 @@ const TIERS = {
   go:   { opus: 'deepseek-v4-flash',      sonnet: 'deepseek-v4-flash',      haiku: 'deepseek-v4-flash' },
   zen:  { opus: 'claude-opus-4-8',        sonnet: 'claude-sonnet-4-6',      haiku: 'claude-haiku-4-5' },
   free: { opus: 'deepseek-v4-flash-free', sonnet: 'deepseek-v4-flash-free', haiku: 'deepseek-v4-flash-free' },
+  // Real custom defaults are resolved at launch from the provider's /models.
+  custom: { opus: null, sonnet: null, haiku: null },
 };
 
 // --- colors (ANSI; only when a TTY) --------------------------------------
@@ -70,7 +72,8 @@ function readConfig() {
 
 function writeConfig(cfg) {
   fs.mkdirSync(configDir, { recursive: true });
-  const lines = ['OPENCODE_GO_KEY', 'OPENCODE_ZEN_KEY', 'OPENCODE_PLAN', 'OPENCODE_API_KEY']
+  const lines = ['OPENCODE_GO_KEY', 'OPENCODE_ZEN_KEY', 'OPENCODE_PLAN', 'OPENCODE_API_KEY',
+    'OPENCODE_CUSTOM_ENDPOINT', 'OPENCODE_CUSTOM_KEY', 'OPENCODE_CUSTOM_PROVIDER']
     .filter((k) => cfg[k])
     .map((k) => `${k}=${cfg[k]}`);
   fs.writeFileSync(configFile, lines.join('\n') + (lines.length ? '\n' : ''), 'utf8');
@@ -99,7 +102,7 @@ function saveKeyFor(plan, key) {
 function setPlan(plan) {
   plan = plan.trim().toLowerCase();
   if (!Object.hasOwn(TIERS, plan)) {
-    console.log(`${Yellow("Plan must be 'go', 'zen' or 'free'.")}`);
+    console.log(`${Yellow("Plan must be 'go', 'zen', 'free' or 'custom'.")}`);
     process.exit(1);
   }
   const cfg = readConfig();
@@ -111,6 +114,27 @@ function setPlan(plan) {
 function getPlan() {
   const p = readConfig().OPENCODE_PLAN;
   return Object.hasOwn(TIERS, p) ? p : 'go';
+}
+
+// --- custom provider -----------------------------------------------------
+function saveCustom({ endpoint, key, provider }) {
+  const cfg = readConfig();
+  if (endpoint) cfg.OPENCODE_CUSTOM_ENDPOINT = endpoint.trim();
+  // Empty key is allowed (local/no-key providers); '' keys are omitted by writeConfig.
+  if (key !== undefined) cfg.OPENCODE_CUSTOM_KEY = key.trim();
+  if (provider) cfg.OPENCODE_CUSTOM_PROVIDER = provider.trim();
+  cfg.OPENCODE_PLAN = 'custom';
+  writeConfig(cfg);
+}
+
+async function setupCustom() {
+  banner('Configure your custom provider');
+  const endpoint = (await prompt(`${Accent(Bold(' Base URL (OpenAI-compatible, e.g. https://api.openrouter.ai/v1)'))} `)).trim();
+  if (!endpoint) { console.log(`${Yellow("Endpoint can't be empty.")}`); process.exit(1); }
+  const key = (await hiddenPrompt(`${Accent(Bold(' API key (blank = none)'))} `)).trim();
+  const provider = (await prompt(`${Accent(Bold(' Provider tag (default custom)'))} `)).trim() || 'custom';
+  saveCustom({ endpoint, key, provider });
+  console.log(`${Green(`Custom provider '${provider}' saved.`)}  Endpoint: ${endpoint}`);
 }
 
 // --- prompts -------------------------------------------------------------
@@ -135,12 +159,14 @@ async function planPrompt() {
   console.log(`${Dim('  1)')} ${Green(Bold('go'))}${Dim('   - flat-fee Go subscription')}`);
   console.log(`${Dim('  2)')} ${Green(Bold('zen'))}${Dim('  - pay-as-you-go Zen')}`);
   console.log(`${Dim('  3)')} ${Green(Bold('free'))}${Dim(' - no account needed, free models only')}`);
+  console.log(`${Dim('  4)')} ${Green(Bold('custom'))}${Dim(' - any OpenAI-compatible provider (bring your own endpoint & key)')}`);
   for (let i = 0; i < 3; i++) {
-    const p = (await prompt(`${Accent(Bold(' Choose plan [1/2/3]'))} `)).trim().toLowerCase();
+    const p = (await prompt(`${Accent(Bold(' Choose plan [1/2/3/4]'))} `)).trim().toLowerCase();
     if (p === '1' || p === 'go') return setPlan('go');
     if (p === '2' || p === 'zen') return setPlan('zen');
     if (p === '3' || p === 'free') return setPlan('free');
-    console.log(`${Yellow("Pick 1, 2, 3, 'go', 'zen' or 'free'.")}`);
+    if (p === '4' || p === 'custom') return await setupCustom();
+    console.log(`${Yellow("Pick 1, 2, 3, 4, 'go', 'zen', 'free' or 'custom'.")}`);
   }
   console.log(`${Yellow('Aborting after 3 invalid attempts.')}`);
   process.exit(1);
@@ -256,8 +282,17 @@ async function main() {
     console.log("Done. Run 'opencodeclaude' to start.");
     process.exit(0);
   }
+  if (cmd && /^(custom|--custom)$/.test(cmd)) {
+    if (args.length >= 2) saveCustom({ endpoint: args[1], key: args[2], provider: args[3] });
+    else await setupCustom();
+    console.log("Done. Run 'opencodeclaude' to start.");
+    process.exit(0);
+  }
   if (cmd && /^(plan|--plan)$/.test(cmd)) {
-    if (args.length >= 2) setPlan(args[1]);
+    if (args.length >= 2) {
+      if (args[1].trim().toLowerCase() === 'custom') await setupCustom();
+      else setPlan(args[1]);
+    }
     else console.log(`Current plan: ${getPlan()}`);
     process.exit(0);
   }
@@ -331,7 +366,7 @@ async function main() {
   // First run: pick a plan (interactive only).
   if (!readConfig().OPENCODE_PLAN) {
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
-      console.log('No plan configured and stdin is not a terminal.\nRun: opencodeclaude plan go|zen|free');
+      console.log('No plan configured and stdin is not a terminal.\nRun: opencodeclaude plan go|zen|free|custom');
       process.exit(1);
     }
     await planPrompt();
@@ -341,7 +376,9 @@ async function main() {
   const freeMode = plan === 'free';
   let key = null;
 
-  if (!freeMode) {
+  // The custom plan's key is optional (local/no-key providers) and lives in
+  // OPENCODE_CUSTOM_KEY, not the per-plan key slot — skip the key prompts.
+  if (!freeMode && plan !== 'custom') {
     key = getKeyFor(plan);
     if (!key && process.env.OPENCODE_API_KEY) {
       key = process.env.OPENCODE_API_KEY.trim();
@@ -368,15 +405,19 @@ async function main() {
     process.exit(127);
   }
 
-  console.log(`${Accent(Bold(' ● opencodeclaude'))}  ${Dim('> using')} ${Green(Bold(plan))}${Dim(' plan')}${Dim('  (change: opencodeclaude plan go|zen|free, key: opencodeclaude key)')}`);
+  console.log(`${Accent(Bold(' ● opencodeclaude'))}  ${Dim('> using')} ${Green(Bold(plan))}${Dim(' plan')}${Dim('  (change: opencodeclaude plan go|zen|free|custom, key: opencodeclaude key)')}`);
   console.log(`${Dim('   proxy log:')} ${Blue(PROXY_LOG)}`);
 
-  const tiers = TIERS[plan];
+  let tiers = TIERS[plan];
+  const customCfg = readConfig();
   const commonEnv = {
     OPENCODE_GO_KEY: getKeyFor('go') || '',
     OPENCODE_ZEN_KEY: getKeyFor('zen') || '',
     OPENCODE_API_KEY: key || '',
     OPENCODE_PLAN: plan,
+    OPENCODE_CUSTOM_ENDPOINT: customCfg.OPENCODE_CUSTOM_ENDPOINT || '',
+    OPENCODE_CUSTOM_KEY: customCfg.OPENCODE_CUSTOM_KEY || '',
+    OPENCODE_CUSTOM_PROVIDER: customCfg.OPENCODE_CUSTOM_PROVIDER || 'custom',
   };
 
   let proxyProc = null;
@@ -399,12 +440,25 @@ async function main() {
       process.exit(1);
     }
 
+    // Custom plan: resolve the default tiers from the provider's /models (fetched
+    // live by the proxy). Uses the same list Claude Code sees in the picker.
+    if (plan === 'custom') {
+      const list = await fetch(`${PROXY_URL}/v1/models`).then((r) => r.json()).then((d) => d.data || []).catch(() => []);
+      const customModels = list.filter((m) => m.id.startsWith('custom/') && !/embed/i.test(m.id)).map((m) => m.id);
+      if (!customModels.length) {
+        console.log(`${Yellow('No models fetched from your custom provider. Check OPENCODE_CUSTOM_ENDPOINT / key, then run \'opencodeclaude custom\'.')}`);
+        if (proxyProc) proxyProc.kill();
+        process.exit(1);
+      }
+      tiers = { opus: customModels[0], sonnet: customModels[0], haiku: customModels[0] };
+    }
+
     const claudeEnv = {
       ...process.env,
       ...commonEnv,
       ANTHROPIC_BASE_URL: PROXY_URL,
-      ANTHROPIC_API_KEY: freeMode ? 'opencode-free' : key,
-      ANTHROPIC_AUTH_TOKEN: freeMode ? 'opencode-free' : key,
+      ANTHROPIC_API_KEY: freeMode ? 'opencode-free' : (plan === 'custom' ? 'opencode-custom' : key),
+      ANTHROPIC_AUTH_TOKEN: freeMode ? 'opencode-free' : (plan === 'custom' ? 'opencode-custom' : key),
       ANTHROPIC_MODEL: tiers.sonnet,
       ANTHROPIC_DEFAULT_OPUS_MODEL: tiers.opus,
       ANTHROPIC_DEFAULT_SONNET_MODEL: tiers.sonnet,
